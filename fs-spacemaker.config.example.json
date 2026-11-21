@@ -1,0 +1,30 @@
+{
+  "_help": {
+    "usage": "Copy this file as fs-spacemaker.config.json next to fs-spacemaker.exe (or pass --config). Every key is optional; command-line options win over this file.",
+    "scan_threads": "Parallel file reads during scan (default: CPU count, at most 8). Use 1-2 for a single mechanical hard disk.",
+    "apply_threads": "Parallel byte-by-byte verifications during apply (default 4).",
+    "partial_hash_bytes": "Bytes read from the start of a file for the cheap pre-filter (default 65536, minimum 4096).",
+    "excluded_names": "File or folder names never inventoried on either side (case-insensitive).",
+    "report_max_rows": "Maximum rows per table in report.html, largest first (report.csv always has every row).",
+    "include_empty_files": "Content mode only: also delete empty source files (they free no space). Default false.",
+    "delete_read_only": "Also delete read-only source files. Default false (they are protected).",
+    "remove_emptied_dirs": "Remove source folders emptied by the deletions (never folders that were already empty). Default true.",
+    "work_dir": "Folder for the index, plans and reports (default: fs-spacemaker-work next to the executable)."
+  },
+  "scan_threads": 8,
+  "apply_threads": 4,
+  "partial_hash_bytes": 65536,
+  "excluded_names": [
+    "System Volume Information",
+    "$RECYCLE.BIN",
+    "pagefile.sys",
+    "hiberfil.sys",
+    "swapfile.sys",
+    "DumpStack.log.tmp"
+  ],
+  "report_max_rows": 50000,
+  "include_empty_files": false,
+  "delete_read_only": false,
+  "remove_emptied_dirs": true,
+  "work_dir": null
+}

@@ -1,0 +1,45 @@
+# FS SpaceMaker: frees disk space by deleting source files that are verified duplicates of destination files.
+# Build: cargo build --release    Test: cargo test
+
+[package]
+name = "fs-spacemaker"
+version = "1.0.0"
+edition = "2024"
+description = "Safely free disk space by deleting source files verified identical to destination files."
+publish = false
+
+[lib]
+name = "fs_spacemaker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fs-spacemaker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+blake3 = "1.8.7"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6.9", features = ["derive"] }
+csv = "1.4.0"
+fs4 = "1.1.0"
+rayon = "1.12.0"
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+same-file = "1.0.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+walkdir = "2.5.1"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+proptest = "1.12.0"
+tempfile = "3.27.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

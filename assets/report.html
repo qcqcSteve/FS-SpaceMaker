@@ -1,0 +1,441 @@
+<!doctype html>
+<!-- FS SpaceMaker report template: self-contained page; the program replaces the data placeholder
+     with the report JSON. No external resources, works offline. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FS SpaceMaker report</title>
+<style>
+  :root {
+    --bg: #f4f6f9; --panel: #ffffff; --text: #1c2330; --muted: #5d6a7b; --border: #dce2ea;
+    --accent: #2f6fde; --good: #1d8f50; --warn: #b8730a; --bad: #cc3434; --neutral: #66727f;
+    --used: #c3cfdc; --freed: #47b27a; --free: #dff1e6; --residual: #e8a33d; --row-hover: #eef3fb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11151b; --panel: #1a2029; --text: #e5e9ef; --muted: #98a4b3; --border: #2b3340;
+      --accent: #6d9dff; --used: #3a4657; --free: #1f3a2b; --row-hover: #222b37;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #11151b; --panel: #1a2029; --text: #e5e9ef; --muted: #98a4b3; --border: #2b3340;
+    --accent: #6d9dff; --used: #3a4657; --free: #1f3a2b; --row-hover: #222b37;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  header { padding: 20px 24px 12px; border-bottom: 1px solid var(--border); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+  header h1 { margin: 0 0 4px; font-size: 20px; }
+  .meta { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; color: #fff; margin-right: 8px; }
+  .badge.plan { background: var(--accent); } .badge.dry-run { background: var(--warn); } .badge.apply { background: var(--good); }
+  .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  .segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .segmented button { border: 0; background: transparent; color: var(--text); padding: 6px 14px; cursor: pointer; font: inherit; }
+  .segmented button.active { background: var(--accent); color: #fff; }
+  main { padding: 16px 24px 48px; max-width: 1500px; margin: 0 auto; }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; }
+  section h2 { margin: 0 0 10px; font-size: 16px; }
+  .notes li { margin: 4px 0; }
+  .command { display: flex; gap: 8px; align-items: stretch; margin-top: 10px; }
+  .command code { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; overflow-x: auto; white-space: nowrap; font-size: 12px; }
+  button.small { border: 1px solid var(--border); background: var(--bg); color: var(--text); border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
+  .card { border: 1px solid var(--border); border-left: 5px solid var(--neutral); border-radius: 8px; padding: 10px 12px; }
+  .card.good { border-left-color: var(--good); } .card.warn { border-left-color: var(--warn); } .card.bad { border-left-color: var(--bad); }
+  .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  .card .value { font-size: 22px; font-weight: 600; margin: 2px 0; }
+  .card .sub { color: var(--muted); font-size: 12px; }
+  .volume { margin: 10px 0 14px; }
+  .volume .head { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 13px; }
+  .bar { display: flex; height: 22px; border-radius: 6px; overflow: hidden; background: var(--free); border: 1px solid var(--border); margin-top: 4px; }
+  .bar span { display: block; height: 100%; transition: width .35s ease; }
+  .bar .used { background: var(--used); } .bar .freed { background: var(--freed); } .bar .residual { background: var(--residual); }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 4px; flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  input[type=search], select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font: inherit; }
+  input[type=search] { min-width: 260px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { position: sticky; top: 0; background: var(--panel); cursor: pointer; user-select: none; white-space: nowrap; }
+  th.sorted-asc::after { content: " \25B2"; font-size: 10px; } th.sorted-desc::after { content: " \25BC"; font-size: 10px; }
+  tbody tr:hover { background: var(--row-hover); }
+  td.num, th.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.path { word-break: break-all; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 11px; background: var(--bg); border: 1px solid var(--border); white-space: nowrap; }
+  .tag.ok { color: var(--good); border-color: var(--good); } .tag.skip { color: var(--warn); border-color: var(--warn); } .tag.fail { color: var(--bad); border-color: var(--bad); }
+  .tree-name { cursor: default; white-space: nowrap; }
+  .twisty { display: inline-block; width: 16px; cursor: pointer; color: var(--muted); }
+  .mini { display: inline-flex; width: 120px; height: 10px; border-radius: 3px; overflow: hidden; background: var(--bg); border: 1px solid var(--border); vertical-align: middle; }
+  .mini span { height: 100%; } .mini .freed { background: var(--freed); } .mini .residual { background: var(--residual); }
+  .gone { opacity: .45; text-decoration: line-through; }
+  .tabs { display: flex; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--border); margin-bottom: 10px; }
+  .tabs button { border: 1px solid var(--border); border-bottom: 0; border-radius: 8px 8px 0 0; background: var(--bg); color: var(--text); padding: 6px 12px; cursor: pointer; font: inherit; }
+  .tabs button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .muted { color: var(--muted); }
+  .pager { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  .scroll { max-height: 640px; overflow: auto; border: 1px solid var(--border); border-radius: 6px; }
+  .warn-text { color: var(--warn); }
+  @media (max-width: 700px) {
+    header, main { padding-left: 16px; padding-right: 16px; }
+    input[type=search] { min-width: 0; width: 100%; }
+    .mini { width: 60px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">FS SpaceMaker</h1>
+  <div class="meta" id="meta"></div>
+  <div class="toolbar">
+    <div class="segmented" id="view-switch" title="Show the state before or after the processing">
+      <button data-view="before">Before</button><button data-view="after" class="active">After</button>
+    </div>
+    <span class="muted" id="view-hint"></span>
+  </div>
+</header>
+<main>
+  <section id="what"><h2>What happens</h2><ul class="notes" id="notes"></ul><div id="command"></div></section>
+  <section><h2>Summary</h2><div class="cards" id="cards"></div></section>
+  <section><h2>Disk space</h2><div id="volumes"></div></section>
+  <section>
+    <h2>Source folders</h2>
+    <div class="controls">
+      <input type="search" id="folder-search" placeholder="Find a folder by name...">
+      <select id="folder-filter">
+        <option value="tree">Tree view</option>
+        <option value="freed">Fully freed folders</option>
+        <option value="partial">Partially freed folders</option>
+        <option value="untouched">Untouched folders (all residual)</option>
+      </select>
+      <span class="muted" id="folder-info"></span>
+    </div>
+    <div class="scroll"><table><thead id="folder-head"></thead><tbody id="folder-body"></tbody></table></div>
+  </section>
+  <section>
+    <h2 id="largest-title">Largest remaining folders</h2>
+    <div class="controls">
+      <label>Depth <select id="largest-depth"></select></label>
+      <span class="muted">Where the remaining data lives, to evaluate before moving it.</span>
+    </div>
+    <div class="scroll"><table><thead><tr><th>Folder</th><th class="num">Remaining</th><th class="num">Files</th><th></th></tr></thead><tbody id="largest-body"></tbody></table></div>
+  </section>
+  <section>
+    <h2>Details</h2>
+    <div class="tabs" id="tabs"></div>
+    <div class="muted" id="table-description"></div>
+    <div class="controls" style="margin-top:8px">
+      <input type="search" id="table-search" placeholder="Filter rows (path, reason, detail)...">
+      <select id="table-tag"></select>
+      <span class="muted" id="table-info"></span>
+    </div>
+    <div class="scroll"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
+    <div class="pager"><button class="small" id="prev">Previous</button><span id="page-info" class="muted"></span><button class="small" id="next">Next</button></div>
+  </section>
+</main>
+<script id="report-data" type="application/json">__REPORT_DATA__</script>
+<script>
+(function () {
+  "use strict";
+  const PAGE_SIZE = 200;
+  const LARGEST_LIMIT = 100;
+  const MAX_FLAT_FOLDERS = 2000;
+  const MAX_DEPTH_CHOICES = 8;
+  const UNITS = ["bytes", "KB", "MB", "GB", "TB", "PB"];
+  const data = JSON.parse(document.getElementById("report-data").textContent);
+  const folders = data.folders;
+  const separator = data.source_root.includes("\\") ? "\\" : "/";
+  const state = { view: "after", expanded: new Set([0]), table: 0, query: "", tag: "", sortColumn: 2, sortDescending: true, page: 0 };
+
+  // ---------- helpers ----------
+  function formatBytes(bytes) {
+    if (bytes === null || bytes === undefined) return "n/a";
+    if (bytes < 1024) return bytes + " bytes";
+    let value = bytes, unit = 0;
+    while (value >= 1024 && unit < UNITS.length - 1) { value /= 1024; unit++; }
+    return value.toFixed(1) + " " + UNITS[unit];
+  }
+  function formatCount(count) { return Number(count).toLocaleString("en-US"); }
+  function element(tag, attributes, children) {
+    const node = document.createElement(tag);
+    Object.entries(attributes || {}).forEach(([key, value]) => {
+      if (key === "text") node.textContent = value;
+      else if (key === "class") node.className = value;
+      else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+      else node.setAttribute(key, value);
+    });
+    (children || []).forEach((child) => node.append(child));
+    return node;
+  }
+  function joinPath(root, rel) {
+    if (!root) return rel;
+    if (!rel) return root;
+    const native = rel.split("/").join(separator);
+    return root.endsWith(separator) ? root + native : root + separator + native;
+  }
+  const OK_TAGS = new Set(["deleted", "would-delete", "removed-folder", "content", "same-path", "relocated"]);
+  const FAIL_TAGS = new Set(["failed", "error"]);
+  function tagClass(tag) {
+    if (OK_TAGS.has(tag)) return "tag ok";
+    if (FAIL_TAGS.has(tag)) return "tag fail";
+    return tag ? "tag skip" : "tag";
+  }
+  function isAfter() { return state.view === "after"; }
+
+  // ---------- header, notes, cards ----------
+  function renderHeader() {
+    document.getElementById("title").textContent = data.title;
+    const phaseLabel = { "plan": "PLAN - nothing deleted yet", "dry-run": "DRY RUN - nothing deleted", "apply": "RESULT" }[data.phase];
+    const meta = document.getElementById("meta");
+    meta.replaceChildren(
+      element("span", { class: "badge " + data.phase, text: phaseLabel }),
+      document.createTextNode("Mode " + data.mode + " | source " + data.source_root + " | destination " + data.destination_root +
+        " | plan " + data.plan_id.slice(0, 16) + "... | " + data.generated_at + " | v" + data.tool_version)
+    );
+    document.getElementById("view-hint").textContent = data.phase === "plan"
+      ? "After = predicted state if the plan is applied."
+      : (data.phase === "dry-run" ? "After = predicted state if the plan is applied." : "After = measured state after processing.");
+  }
+  function renderNotes() {
+    document.getElementById("notes").replaceChildren(...data.notes.map((note) => element("li", { text: note })));
+    if (!data.apply_command) return;
+    const code = element("code", { text: data.apply_command });
+    const copy = element("button", { class: "small", text: "Copy", onclick: () => navigator.clipboard && navigator.clipboard.writeText(data.apply_command) });
+    document.getElementById("command").replaceChildren(
+      element("div", { class: "muted", text: "Command to launch the processing, once you have reviewed this report:" }),
+      element("div", { class: "command" }, [code, copy])
+    );
+  }
+  function renderCards() {
+    document.getElementById("cards").replaceChildren(...data.cards.map((card) => {
+      const value = card.bytes !== null && card.bytes !== undefined ? formatBytes(card.bytes) : formatCount(card.count || 0);
+      const sub = (card.bytes !== null && card.bytes !== undefined && card.count !== null && card.count !== undefined)
+        ? formatCount(card.count) + " files - " + card.note : card.note;
+      return element("div", { class: "card " + card.tone }, [
+        element("div", { class: "label", text: card.label }),
+        element("div", { class: "value", text: value }),
+        element("div", { class: "sub", text: sub }),
+      ]);
+    }));
+  }
+
+  // ---------- volumes ----------
+  function renderVolumes() {
+    document.getElementById("volumes").replaceChildren(...data.volumes.map((volume) => {
+      const total = volume.total || 0;
+      const freeBefore = volume.free_before || 0;
+      const freeAfter = volume.free_after === null || volume.free_after === undefined ? freeBefore : volume.free_after;
+      const gained = Math.max(0, freeAfter - freeBefore);
+      const usedAfter = Math.max(0, total - freeAfter);
+      const percent = (bytes) => total > 0 ? (100 * bytes / total).toFixed(3) + "%" : "0%";
+      const bar = isAfter()
+        ? [element("span", { class: "used", style: "width:" + percent(usedAfter) }), element("span", { class: "freed", style: "width:" + percent(gained) })]
+        : [element("span", { class: "used", style: "width:" + percent(total - freeBefore) })];
+      const free = isAfter() ? freeAfter : freeBefore;
+      return element("div", { class: "volume" }, [
+        element("div", { class: "head" }, [
+          element("strong", { text: volume.label + " - " + volume.path }),
+          element("span", { text: "free " + formatBytes(free) + " of " + formatBytes(volume.total) + (isAfter() && gained ? " (+" + formatBytes(gained) + ")" : "") }),
+        ]),
+        element("div", { class: "bar" }, bar),
+        element("div", { class: "legend" }, [
+          element("span", {}, [element("i", { style: "background:var(--used)" }), document.createTextNode("used")]),
+          element("span", {}, [element("i", { style: "background:var(--freed)" }), document.createTextNode("freed")]),
+          element("span", {}, [element("i", { style: "background:var(--free)" }), document.createTextNode("free")]),
+          element("span", { text: volume.note }),
+        ]),
+      ]);
+    }));
+  }
+
+  // ---------- folder tree ----------
+  const children = folders.parent.map(() => []);
+  folders.parent.forEach((parent, id) => { if (parent >= 0) children[parent].push(id); });
+  children.forEach((list) => list.sort((a, b) => folders.before_bytes[b] - folders.before_bytes[a]));
+  const depths = folders.parent.map(() => 0);
+  folders.parent.forEach((parent, id) => { if (parent >= 0) depths[id] = depths[parent] + 1; });
+  function afterBytes(id) { return folders.before_bytes[id] - folders.removed_bytes[id]; }
+  function afterFiles(id) { return folders.before_files[id] - folders.removed_files[id]; }
+  function isFullyFreed(id) { return folders.before_files[id] > 0 && afterFiles(id) === 0; }
+  function folderPath(id) {
+    const names = [];
+    for (let current = id; current > 0; current = folders.parent[current]) names.unshift(folders.name[current]);
+    return joinPath(data.source_root, names.join("/"));
+  }
+  function miniBar(id) {
+    const before = folders.before_bytes[id] || 0;
+    const freedShare = before ? 100 * folders.removed_bytes[id] / before : 0;
+    return element("span", { class: "mini", title: (before ? freedShare.toFixed(1) : "0") + "% freed" }, [
+      element("span", { class: "freed", style: "width:" + freedShare + "%" }),
+      element("span", { class: "residual", style: "width:" + (before ? 100 - freedShare : 0) + "%" }),
+    ]);
+  }
+  function folderHead() {
+    const sizeLabel = isAfter() ? "Size after" : "Size before";
+    document.getElementById("folder-head").replaceChildren(element("tr", {}, [
+      element("th", { text: "Folder" }), element("th", { class: "num", text: sizeLabel }),
+      element("th", { class: "num", text: "Freed" }), element("th", { class: "num", text: "Files after / before" }),
+      element("th", { text: "Freed share" }),
+    ]));
+  }
+  function folderRow(id, label, indent) {
+    const hasChildren = children[id].length > 0;
+    const twisty = element("span", { class: "twisty", text: hasChildren ? (state.expanded.has(id) ? "▾" : "▸") : "" });
+    if (hasChildren) twisty.addEventListener("click", () => { state.expanded.has(id) ? state.expanded.delete(id) : state.expanded.add(id); renderFolders(); });
+    const gone = isAfter() && isFullyFreed(id) && id !== 0;
+    const name = element("span", { class: gone ? "gone" : "", text: label, title: folderPath(id) });
+    return element("tr", {}, [
+      element("td", { class: "tree-name", style: "padding-left:" + (8 + indent * 16) + "px" }, [twisty, name]),
+      element("td", { class: "num", text: formatBytes(isAfter() ? afterBytes(id) : folders.before_bytes[id]) }),
+      element("td", { class: "num", text: formatBytes(folders.removed_bytes[id]) }),
+      element("td", { class: "num", text: formatCount(afterFiles(id)) + " / " + formatCount(folders.before_files[id]) }),
+      element("td", {}, [miniBar(id)]),
+    ]);
+  }
+  function treeRows(id, indent, rows) {
+    rows.push(folderRow(id, id === 0 ? data.source_root : folders.name[id], indent));
+    if (!state.expanded.has(id)) return;
+    children[id].forEach((child) => treeRows(child, indent + 1, rows));
+  }
+  function flatFolderIds(filter, query) {
+    const matches = [];
+    for (let id = 0; id < folders.parent.length; id++) {
+      if (query && !folders.name[id].toLowerCase().includes(query)) continue;
+      if (filter === "freed" && !isFullyFreed(id)) continue;
+      if (filter === "partial" && !(folders.removed_bytes[id] > 0 && afterFiles(id) > 0)) continue;
+      if (filter === "untouched" && !(folders.removed_files[id] === 0 && folders.before_files[id] > 0)) continue;
+      matches.push(id);
+    }
+    return matches.sort((a, b) => folders.before_bytes[b] - folders.before_bytes[a]);
+  }
+  function renderFolders() {
+    folderHead();
+    const query = document.getElementById("folder-search").value.trim().toLowerCase();
+    const filter = document.getElementById("folder-filter").value;
+    const body = document.getElementById("folder-body");
+    const info = document.getElementById("folder-info");
+    if (!folders.parent.length) { body.replaceChildren(); info.textContent = "No folders."; return; }
+    if (!query && filter === "tree") {
+      const rows = [];
+      treeRows(0, 0, rows);
+      body.replaceChildren(...rows);
+      info.textContent = formatCount(folders.parent.length) + " folders" + (folders.is_truncated ? " (tree truncated, see CSV)" : "") + ". Click ▸ to expand.";
+      return;
+    }
+    const ids = flatFolderIds(filter, query);
+    body.replaceChildren(...ids.slice(0, MAX_FLAT_FOLDERS).map((id) => folderRow(id, folderPath(id), 0)));
+    info.textContent = formatCount(ids.length) + " folders match" + (ids.length > MAX_FLAT_FOLDERS ? ", showing the " + MAX_FLAT_FOLDERS + " largest" : "") + ".";
+  }
+
+  // ---------- largest remaining ----------
+  function renderLargest() {
+    const select = document.getElementById("largest-depth");
+    const depth = Number(select.value || 1);
+    const ids = [];
+    for (let id = 0; id < depths.length; id++) if (depths[id] === depth && afterBytes(id) > 0) ids.push(id);
+    ids.sort((a, b) => afterBytes(b) - afterBytes(a));
+    const top = ids.slice(0, LARGEST_LIMIT);
+    const max = top.length ? afterBytes(top[0]) : 1;
+    document.getElementById("largest-title").textContent = data.phase === "apply" ? "Largest remaining folders (measured)" : "Largest remaining folders (predicted)";
+    document.getElementById("largest-body").replaceChildren(...top.map((id) => element("tr", {}, [
+      element("td", { class: "path", text: folderPath(id) }),
+      element("td", { class: "num", text: formatBytes(afterBytes(id)) }),
+      element("td", { class: "num", text: formatCount(afterFiles(id)) }),
+      element("td", {}, [element("span", { class: "mini" }, [element("span", { class: "residual", style: "width:" + (100 * afterBytes(id) / max) + "%" })])]),
+    ])));
+  }
+  function setupLargest() {
+    const maxDepth = Math.min(MAX_DEPTH_CHOICES, depths.reduce((max, depth) => Math.max(max, depth), 1));
+    const select = document.getElementById("largest-depth");
+    for (let depth = 1; depth <= maxDepth; depth++) select.append(element("option", { value: String(depth), text: String(depth) }));
+    select.addEventListener("change", renderLargest);
+  }
+
+  // ---------- detail tables ----------
+  function currentTable() { return data.tables[state.table]; }
+  function visibleColumns(table) { return table.columns.map((label, index) => ({ label, index })).filter((column) => column.label); }
+  function filteredRows(table) {
+    const query = state.query.toLowerCase();
+    let rows = table.rows.filter((row) => (!state.tag || row[3] === state.tag) &&
+      (!query || row[0].toLowerCase().includes(query) || row[1].toLowerCase().includes(query) || row[3].toLowerCase().includes(query) || row[4].toLowerCase().includes(query)));
+    const column = state.sortColumn;
+    const direction = state.sortDescending ? -1 : 1;
+    rows = rows.slice().sort((a, b) => (column === 2 ? a[2] - b[2] : String(a[column]).localeCompare(String(b[column]))) * direction);
+    return rows;
+  }
+  function renderTabs() {
+    document.getElementById("tabs").replaceChildren(...data.tables.map((table, index) => element("button", {
+      class: index === state.table ? "active" : "",
+      text: table.title + " (" + formatCount(table.total_rows) + ")",
+      onclick: () => { state.table = index; state.query = ""; state.tag = ""; state.page = 0; state.sortColumn = 2; state.sortDescending = true;
+        document.getElementById("table-search").value = ""; renderTabs(); setupTagFilter(); renderTable(); },
+    })));
+  }
+  function setupTagFilter() {
+    const table = currentTable();
+    const tags = [...new Set(table.rows.map((row) => row[3]).filter(Boolean))].sort();
+    const select = document.getElementById("table-tag");
+    select.replaceChildren(element("option", { value: "", text: "All tags" }), ...tags.map((tag) => element("option", { value: tag, text: tag })));
+    select.style.display = tags.length > 1 ? "" : "none";
+  }
+  function renderTableHead(table) {
+    const cells = visibleColumns(table).map((column) => {
+      const classes = [column.index === 2 ? "num" : "", state.sortColumn === column.index ? (state.sortDescending ? "sorted-desc" : "sorted-asc") : ""].join(" ").trim();
+      return element("th", { class: classes, text: column.label, onclick: () => {
+        state.sortDescending = state.sortColumn === column.index ? !state.sortDescending : column.index === 2;
+        state.sortColumn = column.index; state.page = 0; renderTable();
+      } });
+    });
+    document.getElementById("table-head").replaceChildren(element("tr", {}, cells));
+  }
+  function tableCell(table, row, index) {
+    if (index === 2) return element("td", { class: "num", text: formatBytes(row[2]) });
+    if (index === 3) return element("td", {}, [element("span", { class: tagClass(row[3]), text: row[3] })]);
+    if (index === 0) return element("td", { class: "path", text: row[0] || "(root)", title: joinPath(table.path_root, row[0]) });
+    if (index === 1) {
+      const isPath = table.other_root !== "";
+      return element("td", { class: "path", text: row[1], title: isPath ? joinPath(table.other_root, row[1]) : row[1] });
+    }
+    return element("td", { text: row[4] });
+  }
+  function renderTable() {
+    const table = currentTable();
+    if (!table) return;
+    document.getElementById("table-description").textContent = table.description +
+      (table.path_root ? " Paths are relative to " + table.path_root + (table.other_root ? " and " + table.other_root : "") + " (hover for full path)." : "");
+    renderTableHead(table);
+    const rows = filteredRows(table);
+    const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+    state.page = Math.min(state.page, pages - 1);
+    const start = state.page * PAGE_SIZE;
+    const columns = visibleColumns(table);
+    document.getElementById("table-body").replaceChildren(...rows.slice(start, start + PAGE_SIZE).map((row) =>
+      element("tr", {}, columns.map((column) => tableCell(table, row, column.index)))));
+    const shownBytes = rows.reduce((sum, row) => sum + row[2], 0);
+    const truncated = table.total_rows > table.rows.length ? " | report keeps the " + formatCount(table.rows.length) + " largest of " + formatCount(table.total_rows) + " rows: full list in report.csv" : "";
+    document.getElementById("table-info").textContent = formatCount(rows.length) + " rows, " + formatBytes(shownBytes) + truncated;
+    document.getElementById("page-info").textContent = "Page " + (state.page + 1) + " / " + pages;
+    document.getElementById("prev").disabled = state.page === 0;
+    document.getElementById("next").disabled = state.page >= pages - 1;
+  }
+
+  // ---------- view switch and wiring ----------
+  function setView(view) {
+    state.view = view;
+    document.querySelectorAll("#view-switch button").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
+    renderVolumes(); renderFolders();
+  }
+  document.querySelectorAll("#view-switch button").forEach((button) => button.addEventListener("click", () => setView(button.dataset.view)));
+  document.getElementById("folder-search").addEventListener("input", renderFolders);
+  document.getElementById("folder-filter").addEventListener("change", renderFolders);
+  document.getElementById("table-search").addEventListener("input", (event) => { state.query = event.target.value; state.page = 0; renderTable(); });
+  document.getElementById("table-tag").addEventListener("change", (event) => { state.tag = event.target.value; state.page = 0; renderTable(); });
+  document.getElementById("prev").addEventListener("click", () => { state.page--; renderTable(); });
+  document.getElementById("next").addEventListener("click", () => { state.page++; renderTable(); });
+
+  renderHeader(); renderNotes(); renderCards(); setView("after"); setupLargest(); renderLargest(); renderTabs(); setupTagFilter(); renderTable();
+})();
+</script>
+</body>
+</html>
