@@ -54,10 +54,10 @@ struct ScanArgs {
     /// How a source file must correspond to a destination file.
     #[arg(long, value_enum, default_value_t = MatchMode::Content)]
     mode: MatchMode,
-    /// Configuration file (default: fs-spacemaker.config.json next to the executable, if present).
+    /// Configuration file (default: fs-spacemaker.config.json in the installation folder, if present).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Folder for the index, plans and reports (default: fs-spacemaker-work next to the executable).
+    /// Folder for the index, plans and reports (default: fs-spacemaker-work in the installation folder).
     #[arg(long)]
     work_dir: Option<PathBuf>,
     /// Parallel file reads.
@@ -69,6 +69,10 @@ struct ScanArgs {
     /// Also delete read-only source files.
     #[arg(long)]
     delete_read_only: bool,
+    /// NTFS stream name holding no user data, ignored when comparing (repeatable; '*' at the end
+    /// matches a prefix, e.g. --ignore-stream "com.dropbox.*").
+    #[arg(long = "ignore-stream", value_name = "NAME")]
+    ignored_streams: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -113,6 +117,8 @@ fn run_scan_command(args: ScanArgs) -> Result<ExitCode> {
     }
     config.include_empty_files |= args.include_empty_files;
     config.delete_read_only |= args.delete_read_only;
+    config.ignored_stream_names.extend(args.ignored_streams);
+    config.validate()?;
     let work_dir = resolve_work_dir(&config)?;
     let request =
         ScanRequest { source: args.source, destination: args.destination, mode: args.mode, config, work_dir };

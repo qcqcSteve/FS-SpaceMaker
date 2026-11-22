@@ -10,8 +10,6 @@ use chrono::Local;
 const BYTE_UNITS: [&str; 6] = ["bytes", "KB", "MB", "GB", "TB", "PB"];
 /// Ratio between two consecutive byte units.
 const UNIT_STEP: f64 = 1024.0;
-/// Timestamp layout used in folder names (sortable, no characters forbidden on Windows).
-const PATH_TIMESTAMP_FORMAT: &str = "%Y%m%d-%H%M%S";
 
 // ----------------------------------------------------------------------------------------------
 // Formatting
@@ -29,11 +27,6 @@ pub fn format_bytes(bytes: u64) -> String {
         unit_index += 1;
     }
     format!("{value:.1} {}", BYTE_UNITS[unit_index])
-}
-
-/// Returns the local time formatted for use inside a folder name.
-pub fn timestamp_for_path() -> String {
-    Local::now().format(PATH_TIMESTAMP_FORMAT).to_string()
 }
 
 /// Returns the local time in RFC 3339 format.
@@ -60,11 +53,5 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.0 KB");
         assert_eq!(format_bytes(1536 * 1024), "1.5 MB");
         assert_eq!(format_bytes(5 * 1024 * 1024 * 1024), "5.0 GB");
-    }
-
-    #[test]
-    fn path_timestamp_has_no_forbidden_characters() {
-        let stamp = timestamp_for_path();
-        assert!(!stamp.contains(':') && !stamp.contains('/') && !stamp.contains('\\'));
     }
 }

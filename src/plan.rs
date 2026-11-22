@@ -16,8 +16,6 @@ use crate::matching::MatchMode;
 
 /// Version of the plan file layout; apply refuses other versions.
 pub const PLAN_FORMAT_VERSION: u32 = 1;
-/// File name of the plan inside a run folder.
-pub const PLAN_FILE_NAME: &str = "plan.json";
 /// Number of identifier characters the user must type to confirm.
 pub const CONFIRMATION_LENGTH: usize = 8;
 
@@ -45,6 +43,10 @@ pub struct PlanBody {
     pub destination_root: String,
     pub delete_read_only: bool,
     pub remove_emptied_dirs: bool,
+    /// Alternate data stream patterns treated as holding no user data. Omitted when empty, so
+    /// plans written before this field existed keep their identifier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_stream_names: Vec<String>,
     pub actions: Vec<PlannedDeletion>,
 }
 
@@ -139,6 +141,8 @@ pub fn read_plan(path: &Path) -> Result<Plan> {
 mod tests {
     use super::*;
 
+    const TEST_PLAN_FILE_NAME: &str = "plan.json";
+
     fn sample_plan() -> Plan {
         Plan::new(PlanBody {
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -148,6 +152,7 @@ mod tests {
             destination_root: "D".to_string(),
             delete_read_only: false,
             remove_emptied_dirs: true,
+            ignored_stream_names: Vec::new(),
             actions: vec![PlannedDeletion {
                 source_rel: "a/b.txt".to_string(),
                 destination_rel: "x/b.txt".to_string(),
@@ -162,7 +167,7 @@ mod tests {
     #[test]
     fn round_trips_through_a_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(PLAN_FILE_NAME);
+        let path = dir.path().join(TEST_PLAN_FILE_NAME);
         let plan = sample_plan();
         write_plan(&plan, &path).unwrap();
         assert_eq!(read_plan(&path).unwrap(), plan);
@@ -172,7 +177,7 @@ mod tests {
     #[test]
     fn detects_any_edit() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(PLAN_FILE_NAME);
+        let path = dir.path().join(TEST_PLAN_FILE_NAME);
         write_plan(&sample_plan(), &path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         fs::write(&path, text.replace("x/b.txt", "y/b.txt")).unwrap();
@@ -182,7 +187,7 @@ mod tests {
     #[test]
     fn rejects_other_format_versions() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(PLAN_FILE_NAME);
+        let path = dir.path().join(TEST_PLAN_FILE_NAME);
         let mut plan = sample_plan();
         plan.format_version = PLAN_FORMAT_VERSION + 1;
         write_plan(&plan, &path).unwrap();
@@ -197,6 +202,16 @@ mod tests {
         assert!(verify_confirmation(&plan, Some(plan.confirmation_code())).is_ok());
         let upper = plan.confirmation_code().to_uppercase();
         assert!(verify_confirmation(&plan, Some(&upper)).is_ok());
+    }
+
+    #[test]
+    fn plans_without_ignored_streams_keep_their_identifier() {
+        let plan = sample_plan();
+        let text = serde_json::to_string(&plan).unwrap();
+        assert!(!text.contains("ignored_stream_names"), "empty list is not written");
+        let mut with_streams = plan.body.clone();
+        with_streams.ignored_stream_names = vec!["com.dropbox.*".to_string()];
+        assert_ne!(compute_plan_id(&with_streams).unwrap(), plan.plan_id);
     }
 
     #[test]

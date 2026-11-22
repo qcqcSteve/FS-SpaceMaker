@@ -9,7 +9,8 @@
     "include_empty_files": "Content mode only: also delete empty source files (they free no space). Default false.",
     "delete_read_only": "Also delete read-only source files. Default false (they are protected).",
     "remove_emptied_dirs": "Remove source folders emptied by the deletions (never folders that were already empty). Default true.",
-    "work_dir": "Folder for the index, plans and reports (default: fs-spacemaker-work next to the executable)."
+    "ignored_stream_names": "NTFS alternate data stream names holding no user data, ignored when comparing (a trailing * matches a prefix). Other streams must exist, byte-identical, on the destination copy. Example: [\"com.dropbox.*\"].",
+    "work_dir": "Folder for the index, plans and reports (default: fs-spacemaker-work in the installation folder: the project folder for a cargo build, else the executable folder)."
   },
   "scan_threads": 8,
   "apply_threads": 4,
@@ -26,5 +27,6 @@
   "include_empty_files": false,
   "delete_read_only": false,
   "remove_emptied_dirs": true,
+  "ignored_stream_names": [],
   "work_dir": null
 }

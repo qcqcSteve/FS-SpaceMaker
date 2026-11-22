@@ -11,6 +11,7 @@ pub mod hashing;
 pub mod index;
 pub mod inventory;
 pub mod matching;
+pub mod outputs;
 pub mod paths;
 pub mod plan;
 pub mod platform;

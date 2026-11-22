@@ -16,19 +16,22 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
 use crate::config::Config;
-use crate::format::{format_bytes, timestamp_for_path, timestamp_iso};
+use crate::format::{format_bytes, timestamp_iso};
 use crate::hashing::{compare_readers, to_hex};
 use crate::inventory::{Inventory, ScanError, WalkOptions, modified_ns, scan_tree};
+use crate::outputs::apply_paths;
 use crate::paths::{
     canonical_root, depth_of, display_joined, display_path, ensure_disjoint_roots, join_rel, name_key,
     parent_rel, rel_to_path,
 };
 use crate::plan::{Plan, PlannedDeletion, read_plan, verify_confirmation};
-use crate::platform::{has_meaningful_streams, is_cloud_placeholder, is_in_use_error, open_source_locked};
+use crate::platform::{
+    StreamCheck, check_streams, is_cloud_placeholder, is_in_use_error, open_source_locked,
+};
 use crate::progress::{ProgressMeter, print_step};
 use crate::report::{
-    CSV_FILE_NAME, Card, FolderFile, FolderTable, HTML_FILE_NAME, Phase, ReportData, ReportRow, Table, Tone,
-    VolumeBar, aggregate_folders, write_report,
+    Card, FolderFile, FolderTable, Phase, ReportData, ReportRow, Table, Tone, VolumeBar, aggregate_folders,
+    write_report,
 };
 use crate::scan::{TOOL_VERSION, build_pool, card};
 use crate::space::{VolumeSpace, volume_space};
@@ -37,13 +40,9 @@ use crate::space::{VolumeSpace, volume_space};
 // Configuration
 // ----------------------------------------------------------------------------------------------
 
-/// Journal file name inside an apply run folder.
-pub const JOURNAL_FILE_NAME: &str = "journal.csv";
+/// Column names of the journal.
 const JOURNAL_HEADER: [&str; 6] =
     ["timestamp", "status", "source_path", "destination_path", "size_bytes", "detail"];
-/// Prefix of apply run folders (created next to the plan).
-const APPLY_DIR_PREFIX: &str = "apply-";
-const DRY_RUN_DIR_SUFFIX: &str = "-dry-run";
 
 // ----------------------------------------------------------------------------------------------
 // Model
@@ -119,7 +118,6 @@ pub struct ApplyOutput {
     pub cleanup_errors: Vec<ScanError>,
     pub space_before: VolumeSpace,
     pub space_after: VolumeSpace,
-    pub run_dir: PathBuf,
     pub journal_path: PathBuf,
     pub html_path: PathBuf,
     pub csv_path: PathBuf,
@@ -167,6 +165,7 @@ struct ActionContext {
     destination_root: PathBuf,
     is_dry_run: bool,
     delete_read_only: bool,
+    ignored_stream_names: Vec<String>,
     is_aborted: AtomicBool,
 }
 
@@ -200,9 +199,9 @@ pub fn run_apply(request: &ApplyRequest) -> Result<ApplyOutput> {
         plan.body.actions.len(),
         format_bytes(plan.total_bytes())
     );
-    let run_dir = create_apply_dir(&request.plan_path, request.is_dry_run)?;
-    let journal_path = run_dir.join(JOURNAL_FILE_NAME);
-    let journal = Journal::create(&journal_path, &context)?;
+    let paths = apply_paths(&output_dir_of(&request.plan_path), request.is_dry_run);
+    // A dry run replaces its journal; a real apply appends, so no trace of a deletion is ever lost.
+    let journal = Journal::open(&paths.journal, &context, !request.is_dry_run)?;
     let space_before = volume_space(&context.source_root);
     print_step(if request.is_dry_run {
         "Verifying (dry run: nothing is deleted)"
@@ -226,10 +225,9 @@ pub fn run_apply(request: &ApplyRequest) -> Result<ApplyOutput> {
         cleanup_errors,
         space_before,
         space_after,
-        html_path: run_dir.join(HTML_FILE_NAME),
-        csv_path: run_dir.join(CSV_FILE_NAME),
-        run_dir,
-        journal_path,
+        html_path: paths.html,
+        csv_path: paths.csv,
+        journal_path: paths.journal,
     };
     write_apply_report(&output, &context, &request.config)?;
     Ok(output)
@@ -247,6 +245,7 @@ fn prepare_context(plan: &Plan, is_dry_run: bool) -> Result<ActionContext> {
         destination_root,
         is_dry_run,
         delete_read_only: plan.body.delete_read_only,
+        ignored_stream_names: plan.body.ignored_stream_names.clone(),
         is_aborted: AtomicBool::new(false),
     })
 }
@@ -265,19 +264,9 @@ fn resolve_plan_root(recorded: &str, side: &str) -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Creates the apply run folder next to the plan.
-fn create_apply_dir(plan_path: &Path, is_dry_run: bool) -> Result<PathBuf> {
-    let parent = plan_path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let suffix = if is_dry_run { DRY_RUN_DIR_SUFFIX } else { "" };
-    let base = format!("{APPLY_DIR_PREFIX}{}{suffix}", timestamp_for_path());
-    let mut candidate = parent.join(&base);
-    let mut counter = 2;
-    while candidate.exists() {
-        candidate = parent.join(format!("{base}-{counter}"));
-        counter += 1;
-    }
-    fs::create_dir_all(&candidate).with_context(|| format!("Cannot create {}", candidate.display()))?;
-    Ok(candidate)
+/// Returns the folder holding the plan, where the apply outputs are written.
+fn output_dir_of(plan_path: &Path) -> PathBuf {
+    plan_path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf()
 }
 
 /// Executes every action in parallel and journals each decision as soon as it is taken.
@@ -351,7 +340,7 @@ fn check_preconditions(
     let source_metadata = check_source_unchanged(source_path, action)?;
     check_destination_present(destination_path, action.size)?;
     check_not_same_file(source_path, destination_path)?;
-    check_no_alternate_streams(source_path)?;
+    check_streams_copied(source_path, destination_path, &context.ignored_stream_names)?;
     check_read_only_allowed(&source_metadata, context.delete_read_only)?;
     Ok(source_metadata)
 }
@@ -364,15 +353,20 @@ fn io_rejection(action: &str, error: &io::Error) -> Rejection {
     reject(ActionStatus::Failed, format!("{action}: {error}"))
 }
 
-/// Fails if the source has NTFS alternate data streams that byte comparison would not cover.
-fn check_no_alternate_streams(source: &Path) -> Result<(), Rejection> {
-    match has_meaningful_streams(source) {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(reject(
+/// Fails unless every NTFS alternate data stream of the source that may hold user data exists,
+/// byte-identical, on the destination copy (the main comparison does not cover streams).
+fn check_streams_copied(
+    source: &Path,
+    destination: &Path,
+    ignored_patterns: &[String],
+) -> Result<(), Rejection> {
+    match check_streams(source, destination, ignored_patterns) {
+        Ok(StreamCheck::Covered) => Ok(()),
+        Ok(StreamCheck::Uncovered(name)) => Err(reject(
             ActionStatus::AlternateStreams,
-            "source has NTFS alternate data streams (hidden data not present in the comparison)",
+            format!("hidden NTFS stream {name:?} is missing or different on the destination copy"),
         )),
-        Err(error) => Err(io_rejection("cannot list alternate data streams", &error)),
+        Err(error) => Err(io_rejection("cannot compare alternate data streams", &error)),
     }
 }
 
@@ -485,12 +479,20 @@ struct Journal {
 }
 
 impl Journal {
-    /// Creates the journal file with its header.
-    fn create(path: &Path, context: &ActionContext) -> Result<Self> {
-        let file = File::create(path)
-            .with_context(|| format!("Cannot create journal {}: nothing deleted.", path.display()))?;
+    /// Opens the journal, appending to an existing one or starting a new file with its header.
+    fn open(path: &Path, context: &ActionContext, is_append: bool) -> Result<Self> {
+        let has_content = is_append && fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0);
+        let file = File::options()
+            .create(true)
+            .write(true)
+            .append(is_append)
+            .truncate(!is_append)
+            .open(path)
+            .with_context(|| format!("Cannot open journal {}: nothing deleted.", path.display()))?;
         let mut writer = csv::Writer::from_writer(file);
-        writer.write_record(JOURNAL_HEADER)?;
+        if !has_content {
+            writer.write_record(JOURNAL_HEADER)?;
+        }
         writer.flush()?;
         Ok(Self {
             writer: Mutex::new(writer),

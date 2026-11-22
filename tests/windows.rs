@@ -177,6 +177,72 @@ fn hidden_stream_added_after_scan_protects_the_source() {
 }
 
 #[test]
+fn hidden_stream_copied_identically_allows_deletion() {
+    let sandbox = Sandbox::new();
+    let source = sandbox.write_source("photo.jpg", b"jpeg bytes");
+    let destination = sandbox.write_destination("photo.jpg", b"jpeg bytes");
+    write_stream(&source, "com.dropbox.attributes", b"sync metadata");
+    write_stream(&destination, "com.dropbox.attributes", b"sync metadata");
+    let scan = sandbox.scan(MatchMode::Content);
+    assert_eq!(sandbox.apply(&scan).count(ActionStatus::Deleted), 1);
+    assert!(!source.exists());
+}
+
+#[test]
+fn hidden_stream_with_different_content_protects_the_source() {
+    let sandbox = Sandbox::new();
+    let source = sandbox.write_source("photo.jpg", b"jpeg bytes");
+    let destination = sandbox.write_destination("photo.jpg", b"jpeg bytes");
+    write_stream(&source, "notes", b"version A");
+    write_stream(&destination, "notes", b"version B");
+    assert!(sandbox.scan(MatchMode::Content).plan.body.actions.is_empty());
+    assert!(source.exists());
+}
+
+#[test]
+fn hidden_stream_changed_on_destination_after_scan_protects_the_source() {
+    let sandbox = Sandbox::new();
+    let source = sandbox.write_source("photo.jpg", b"jpeg bytes");
+    let destination = sandbox.write_destination("photo.jpg", b"jpeg bytes");
+    write_stream(&source, "notes", b"same notes");
+    write_stream(&destination, "notes", b"same notes");
+    let scan = sandbox.scan(MatchMode::Content);
+    assert_eq!(scan.plan.body.actions.len(), 1);
+    write_stream(&destination, "notes", b"edited notes");
+    let output = sandbox.apply(&scan);
+    assert_eq!(output.results[0].status, ActionStatus::AlternateStreams);
+    assert!(source.exists());
+}
+
+#[test]
+fn ignored_stream_names_allow_deletion_without_a_copied_stream() {
+    let sandbox = Sandbox::new();
+    let source = sandbox.write_source("photo.jpg", b"jpeg bytes");
+    sandbox.write_destination("photo.jpg", b"jpeg bytes");
+    write_stream(&source, "com.dropbox.attrs", b"sync metadata");
+    assert!(sandbox.scan(MatchMode::Content).plan.body.actions.is_empty(), "protected by default");
+    let scan = sandbox.scan_with(MatchMode::Content, |config| {
+        config.ignored_stream_names = vec!["com.dropbox.*".to_string()];
+    });
+    assert_eq!(scan.plan.body.ignored_stream_names, vec!["com.dropbox.*"]);
+    assert_eq!(sandbox.apply(&scan).count(ActionStatus::Deleted), 1);
+    assert!(!source.exists());
+}
+
+#[test]
+fn ignored_stream_names_do_not_cover_other_streams() {
+    let sandbox = Sandbox::new();
+    let source = sandbox.write_source("photo.jpg", b"jpeg bytes");
+    sandbox.write_destination("photo.jpg", b"jpeg bytes");
+    write_stream(&source, "com.dropbox.attrs", b"sync metadata");
+    write_stream(&source, "notes", b"user notes");
+    let scan = sandbox.scan_with(MatchMode::Content, |config| {
+        config.ignored_stream_names = vec!["com.dropbox.*".to_string()];
+    });
+    assert!(scan.plan.body.actions.is_empty());
+}
+
+#[test]
 fn download_origin_mark_does_not_block_deletion() {
     let sandbox = Sandbox::new();
     let path = sandbox.write_source("setup.exe", b"installer bytes");

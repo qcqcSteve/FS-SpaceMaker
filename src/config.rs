@@ -1,4 +1,4 @@
-//! Runtime settings: built-in defaults, optional JSON file (next to the executable or --config),
+//! Runtime settings: built-in defaults, optional JSON file (installation folder or --config),
 //! then command-line overrides applied by the caller. Unknown keys are rejected to catch typos.
 
 use std::fs;
@@ -11,10 +11,14 @@ use serde::Deserialize;
 // Configuration
 // ----------------------------------------------------------------------------------------------
 
-/// Name of the optional configuration file looked up next to the executable.
+/// Name of the optional configuration file looked up in the installation folder.
 pub const CONFIG_FILE_NAME: &str = "fs-spacemaker.config.json";
-/// Name of the default work folder (index, plans, reports) created next to the executable.
+/// Name of the default work folder (index, plans, reports) created in the installation folder.
 pub const DEFAULT_WORK_DIR_NAME: &str = "fs-spacemaker-work";
+/// Cargo output layout: an executable in target\release or target\debug belongs to the project
+/// folder above `target`, which is where its work folder and configuration file live.
+const CARGO_TARGET_DIR_NAME: &str = "target";
+const CARGO_PROFILE_DIR_NAMES: [&str; 2] = ["release", "debug"];
 /// Bytes read from the start of a file for the cheap pre-filter fingerprint.
 const DEFAULT_PARTIAL_HASH_BYTES: u64 = 64 * 1024;
 /// Smallest accepted partial fingerprint length.
@@ -25,6 +29,8 @@ const DEFAULT_REPORT_MAX_ROWS: usize = 50_000;
 const MAX_DEFAULT_SCAN_THREADS: usize = 8;
 /// Default number of parallel verifications during apply.
 const DEFAULT_APPLY_THREADS: usize = 4;
+/// Characters not allowed in an ignored stream pattern ('*' is only allowed as the last character).
+const FORBIDDEN_STREAM_PATTERN_CHARS: [char; 4] = ['*', ':', '\\', '/'];
 /// Names never inventoried, on either side (compared case-insensitively).
 const DEFAULT_EXCLUDED_NAMES: [&str; 6] = [
     "System Volume Information",
@@ -54,6 +60,7 @@ pub struct Config {
     pub include_empty_files: bool,
     pub delete_read_only: bool,
     pub remove_emptied_dirs: bool,
+    pub ignored_stream_names: Vec<String>,
     pub work_dir: Option<PathBuf>,
 }
 
@@ -69,6 +76,7 @@ impl Default for Config {
             include_empty_files: false,
             delete_read_only: false,
             remove_emptied_dirs: true,
+            ignored_stream_names: Vec::new(),
             work_dir: None,
         }
     }
@@ -86,8 +94,22 @@ impl Config {
         if self.report_max_rows == 0 {
             bail!("report_max_rows must be at least 1: fix the configuration.");
         }
+        if let Some(pattern) =
+            self.ignored_stream_names.iter().find(|pattern| !is_valid_stream_pattern(pattern))
+        {
+            bail!(
+                "Invalid ignored stream name {pattern:?}: use a stream name, optionally ending with '*' \
+                 (e.g. com.dropbox.*)."
+            );
+        }
         Ok(())
     }
+}
+
+/// Returns true if a stream pattern is a non-empty name with at most one '*', at its end.
+fn is_valid_stream_pattern(pattern: &str) -> bool {
+    let name = pattern.strip_suffix('*').unwrap_or(pattern);
+    !name.is_empty() && !name.contains(FORBIDDEN_STREAM_PATTERN_CHARS)
 }
 
 /// Returns the number of logical CPUs, capped for disk-bound work.
@@ -99,11 +121,11 @@ fn default_scan_threads() -> usize {
 // Loading
 // ----------------------------------------------------------------------------------------------
 
-/// Loads the explicit file, else the file next to the executable, else the defaults.
+/// Loads the explicit file, else the file in the installation folder, else the defaults.
 pub fn load_config(explicit_path: Option<&Path>) -> Result<Config> {
     let path = match explicit_path {
         Some(path) => path.to_path_buf(),
-        None => match executable_dir().map(|dir| dir.join(CONFIG_FILE_NAME)) {
+        None => match installation_dir().map(|dir| dir.join(CONFIG_FILE_NAME)) {
             Some(path) if path.is_file() => path,
             _ => return Ok(Config::default()),
         },
@@ -122,17 +144,33 @@ fn parse_config_file(path: &Path) -> Result<Config> {
     Ok(config)
 }
 
-/// Returns the folder containing the running executable.
-pub fn executable_dir() -> Option<PathBuf> {
-    std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
+/// Returns the installation folder: the project folder for a cargo build, else the executable's folder.
+pub fn installation_dir() -> Option<PathBuf> {
+    let executable_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    Some(installation_dir_for(&executable_dir))
 }
 
-/// Returns the configured work folder, or the default one next to the executable.
+/// Maps an executable folder to its installation folder (skips cargo's target\<profile>).
+fn installation_dir_for(executable_dir: &Path) -> PathBuf {
+    let is_profile_dir = executable_dir
+        .file_name()
+        .is_some_and(|name| CARGO_PROFILE_DIR_NAMES.iter().any(|profile| name.eq_ignore_ascii_case(profile)));
+    let target_dir = executable_dir.parent();
+    let is_in_target = target_dir
+        .and_then(Path::file_name)
+        .is_some_and(|name| name.eq_ignore_ascii_case(CARGO_TARGET_DIR_NAME));
+    match (is_profile_dir && is_in_target, target_dir.and_then(Path::parent)) {
+        (true, Some(project_dir)) => project_dir.to_path_buf(),
+        _ => executable_dir.to_path_buf(),
+    }
+}
+
+/// Returns the configured work folder, or the default one in the installation folder.
 pub fn resolve_work_dir(config: &Config) -> Result<PathBuf> {
     if let Some(dir) = &config.work_dir {
         return Ok(dir.clone());
     }
-    executable_dir()
+    installation_dir()
         .map(|dir| dir.join(DEFAULT_WORK_DIR_NAME))
         .context("Cannot locate the executable folder: pass --work-dir.")
 }
@@ -173,6 +211,35 @@ mod tests {
         assert!(load_config(Some(&path)).is_err());
         fs::write(&path, r#"{"scan_threads": 0}"#).unwrap();
         assert!(load_config(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn cargo_builds_use_the_project_folder() {
+        let project = Path::new("projects").join("FS SpaceMaker");
+        for profile in ["release", "debug", "Release"] {
+            let executable_dir = project.join("target").join(profile);
+            assert_eq!(installation_dir_for(&executable_dir), project);
+        }
+    }
+
+    #[test]
+    fn installed_executables_use_their_own_folder() {
+        for executable_dir in [Path::new("tools").join("fs"), Path::new("apps").join("release")] {
+            assert_eq!(installation_dir_for(&executable_dir), executable_dir);
+        }
+    }
+
+    #[test]
+    fn ignored_stream_patterns_are_validated() {
+        let valid = Config {
+            ignored_stream_names: vec!["com.dropbox.*".into(), "Exact".into()],
+            ..Config::default()
+        };
+        valid.validate().unwrap();
+        for bad in ["", "*", "a*b", "a:b", "*.txt"] {
+            let config = Config { ignored_stream_names: vec![bad.to_string()], ..Config::default() };
+            assert!(config.validate().is_err(), "{bad:?} should be rejected");
+        }
     }
 
     #[test]

@@ -1,7 +1,18 @@
 # FS SpaceMaker
 
+![Platform](https://img.shields.io/badge/platform-Windows%20first-0078D6?logo=windows&logoColor=white)
+![Language](https://img.shields.io/badge/Rust-stable-B7410E?logo=rust&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-125%20passing-2EA043)
+![Hash](https://img.shields.io/badge/fingerprint-BLAKE3-8A2BE2)
+![Safety](https://img.shields.io/badge/verification-byte--by--byte-D29922)
+![Destination](https://img.shields.io/badge/destination-never%20modified-1F6FEB)
+
 Frees disk space **without ever losing unique data**. The program deletes from a **source** drive the files
 that have an identical copy on a **destination** drive. The destination is never modified.
+
+> [!IMPORTANT]
+> Nothing is ever deleted by `scan`. Only `apply`, given the **confirmation code** of a reviewed plan,
+> deletes files, and only after re-checking each one byte by byte against its copy.
 
 - **Source**: the drive or folder to free. Only files whose duplicate is proven are deleted there.
 - **Destination**: the drive or folder to keep intact. Nothing is written, moved or deleted there.
@@ -18,6 +29,29 @@ The work is split into two separate commands:
 In between, you read the report. The `apply` command refuses to start without the **confirmation code** of
 the plan you reviewed.
 
+```mermaid
+flowchart LR
+    S[("Source drive")]:::source --> SCAN["fs-spacemaker scan"]:::scan
+    D[("Destination drive<br/>read-only")]:::destination --> SCAN
+    SCAN --> P["plan.json<br/>report.html<br/>report.csv"]:::report
+    P --> R{"You review<br/>the report"}:::review
+    R -->|"--dry-run"| DRY["Every check,<br/>nothing deleted"]:::dry
+    R -->|"--confirm CODE"| APPLY["fs-spacemaker apply"]:::apply
+    APPLY --> V{"Byte-by-byte<br/>identical?"}:::review
+    V -->|yes| DEL["Source file deleted<br/>+ journal line"]:::deleted
+    V -->|no| KEEP["Source file kept<br/>+ reason logged"]:::kept
+
+    classDef source fill:#F0883E,stroke:#BD561D,color:#fff
+    classDef destination fill:#1F6FEB,stroke:#0D419D,color:#fff
+    classDef scan fill:#8957E5,stroke:#553098,color:#fff
+    classDef report fill:#6E7781,stroke:#424A53,color:#fff
+    classDef review fill:#D29922,stroke:#9A6700,color:#fff
+    classDef dry fill:#3FB950,stroke:#1A7F37,color:#fff
+    classDef apply fill:#DA3633,stroke:#A40E26,color:#fff
+    classDef deleted fill:#2EA043,stroke:#116329,color:#fff
+    classDef kept fill:#0969DA,stroke:#033D8B,color:#fff
+```
+
 ---
 
 ## 1. Installation
@@ -30,8 +64,22 @@ cargo build --release
 # Executable: target\release\fs-spacemaker.exe (a single file, no dependencies)
 ```
 
-You can copy `fs-spacemaker.exe` anywhere. By default its working data goes into `fs-spacemaker-work\`,
-next to the executable.
+You can copy `fs-spacemaker.exe` anywhere. By default its working data goes into `fs-spacemaker-work\` in
+the **installation folder**: the project folder (`S:\dev\Legal\FS SpaceMaker\fs-spacemaker-work`) when the
+program runs from cargo's `target\release`, otherwise the folder of the executable.
+
+The tool is meant for one-off use, so it keeps **a single set of outputs**, replaced each time:
+
+```text
+fs-spacemaker-work\
+  index.sqlite                          fingerprint cache (kept, makes later scans fast)
+  plan.json, report.html, report.csv    replaced by each scan
+  dry-run-report.html/.csv, dry-run-journal.csv   replaced by each dry run
+  apply-report.html/.csv, apply-journal.csv       result of the real processing
+```
+
+A new scan removes the previous outputs (only these exact file names, never anything else). The real
+`apply-journal.csv` is appended to, not replaced, if you run `apply` again on the same plan.
 
 ---
 
@@ -51,7 +99,7 @@ commands, ready to copy:
   will be freed:     182344 files, 311.4 GB
   remains on source: 9120 files, 41.7 GB
   source free space: 11.8 GB now -> about 323.2 GB after
-  report: ...\fs-spacemaker-work\runs\20261121-175617-content\report.html
+  report: ...\fs-spacemaker-work\report.html
   ...
 Review the report, then verify without deleting:
   "...\fs-spacemaker.exe" apply --plan "...\plan.json" --dry-run
@@ -72,15 +120,26 @@ fs-spacemaker apply --plan "...\plan.json" --dry-run
 The dry run performs **every** check (including the byte-by-byte comparison) without deleting anything. It
 produces its own report and journal.
 
+> [!TIP]
+> Always run the dry run first: it shows exactly which planned deletions would be skipped (file in use,
+> changed since the scan, etc.) before anything is touched.
+
 ### Step 4: processing
 
 ```powershell
 fs-spacemaker apply --plan "...\plan.json" --confirm 8bfeeeb3
 ```
 
-Processing creates an `apply-YYYYMMDD-HHMMSS\` folder next to the plan, containing:
-- `journal.csv`: every decision (deleted, skipped, failed), written to disk **as it happens**.
-- `report.html` and `report.csv`: the **measured** result. The source is re-inventoried after processing.
+> [!WARNING]
+> Deletions are permanent (the Recycle Bin is not used, so space is freed immediately). Apply only a plan
+> whose report you have reviewed; the confirmation code ties the command to that exact plan.
+
+Processing writes, next to the plan:
+- `apply-journal.csv`: every decision (deleted, skipped, failed), written to disk **as it happens**.
+- `apply-report.html` and `apply-report.csv`: the **measured** result. The source is re-inventoried after
+  processing.
+
+A dry run writes the same three files with the `dry-run-` prefix.
 
 Exit codes: `0` = success, `1` = nothing was done (error before processing),
 `2` = processing finished, but with at least one I/O failure (see the journal).
@@ -132,11 +191,19 @@ again before every deletion.
    meantime, it is left alone.
 6. The source size and date are checked again, in case it was modified during the comparison.
 7. Read-only files are protected unless `delete_read_only` is enabled.
-8. **Windows:** the source has no hidden NTFS stream (ADS, see section 4b).
+8. **Windows:** every hidden NTFS stream of the source (ADS, see section 4b) also exists, byte-identical,
+   on the destination copy.
 9. **Windows:** the source is opened in a way that **forbids any write by another program** from the
    comparison until the deletion, so nothing can modify it between those two moments.
 
-At the slightest discrepancy, the file is **skipped** (left in place) and the reason is logged.
+> [!CAUTION]
+> At the slightest discrepancy, the file is **skipped** (left in place) and the reason is logged. When in
+> doubt, the program always keeps the data.
+
+```diff
++ identical size, date, content and fingerprint  -> source file deleted
+- any difference, file in use, link, hidden data -> source file kept, reason logged
+```
 
 ### Why not Windows Search indexing?
 
@@ -185,7 +252,7 @@ The program is designed first for Windows and tested on Windows 11, with dedicat
 | Windows situation | Behaviour |
 |---|---|
 | File open or locked by another program (Word, Outlook, antivirus, sync) | Skipped (`skipped-in-use`), never forced. It is not a failure: run `apply` again later. |
-| **Alternate data streams (ADS)**, hidden data inside an NTFS file (`file.txt:notes`) | The byte-by-byte comparison only covers the main content, so these files are **protected** (`alternate-streams`). Only exception: `Zone.Identifier`, the "downloaded from the Internet" mark, which holds no data. |
+| **Alternate data streams (ADS)**, hidden data inside an NTFS file (`file.txt:notes`) | Each stream of the source must also exist, **byte-identical**, on the destination copy; otherwise the file is **protected** (`alternate-streams`). `Zone.Identifier` (the "downloaded from the Internet" mark) is always ignored, and you can declare other metadata streams as ignorable with `ignored_stream_names` / `--ignore-stream` (e.g. `com.dropbox.*`, left by the Dropbox client). |
 | OneDrive online-only files | Skipped, so no download is triggered |
 | Junctions, symbolic links, mount points | Never followed, never deleted |
 | Hidden and system files (`Thumbs.db`, `desktop.ini`) | Handled like any other. `desktop.ini` is often read-only, so protected by default. |
@@ -196,8 +263,9 @@ The program is designed first for Windows and tested on Windows 11, with dedicat
 | `System Volume Information`, `$RECYCLE.BIN`, `pagefile.sys`, `hiberfil.sys` | Excluded |
 | Drive root as source (`J:\`), `subst` drive, network path `\\server\share` | Supported |
 
-**Tip:** before `apply`, pause OneDrive sync and any backups that touch the source or the destination. A
-file they have open is simply skipped, but you will get more deletions on the first run.
+> [!TIP]
+> Before `apply`, pause OneDrive sync and any backups that touch the source or the destination. A file they
+> have open is simply skipped, but you will get more deletions on the first run.
 
 ---
 
@@ -237,26 +305,27 @@ every row.** It is UTF-8 encoded with a BOM and opens directly in Excel. Its col
 | `empty-file` | Empty file (content mode) |
 | `read-only` | Protected read-only file |
 | `same-physical-file` | Source and destination are the same file (hard link) |
-| `alternate-streams` | The file holds hidden NTFS streams (ADS), so it is protected |
+| `alternate-streams` | A hidden NTFS stream (ADS) is missing or different on the destination copy, so the file is protected |
 | `unreadable` | The file could not be read (often: locked by another program) |
 
-### Processing statuses (`journal.csv` and `apply` report)
+### Processing statuses (`apply-journal.csv` and `apply-report.html`)
 
-| Status | Meaning |
-|---|---|
-| `deleted` / `would-delete` | Deleted (or would be, in a dry run) after every check |
-| `skipped-source-missing` | The source no longer exists |
-| `skipped-source-changed` | The source changed since the scan (size, date or content) |
-| `skipped-destination-missing` / `skipped-destination-changed` | The copy disappeared or changed |
-| `skipped-content-differs` | The byte-by-byte comparison found a difference |
-| `skipped-same-file` | Source and destination are the same physical file |
-| `skipped-read-only` | Protected read-only file |
-| `skipped-alternate-streams` | Hidden NTFS streams appeared after the scan |
-| `skipped-in-use` | File open or locked by another program |
-| `skipped-cloud-placeholder` | The file became online-only |
-| `failed` | Unexpected I/O error (exit code 2). The file is not touched. |
+| | Status | Meaning |
+|---|---|---|
+| 🟢 | `deleted` / `would-delete` | Deleted (or would be, in a dry run) after every check |
+| 🟡 | `skipped-source-missing` | The source no longer exists |
+| 🟡 | `skipped-source-changed` | The source changed since the scan (size, date or content) |
+| 🟡 | `skipped-destination-missing` / `skipped-destination-changed` | The copy disappeared or changed |
+| 🟡 | `skipped-content-differs` | The byte-by-byte comparison found a difference |
+| 🟡 | `skipped-same-file` | Source and destination are the same physical file |
+| 🟡 | `skipped-read-only` | Protected read-only file |
+| 🟡 | `skipped-alternate-streams` | A hidden NTFS stream is missing or different on the destination copy |
+| 🟡 | `skipped-in-use` | File open or locked by another program |
+| 🟡 | `skipped-cloud-placeholder` | The file became online-only |
+| 🔴 | `failed` | Unexpected I/O error (exit code 2). The file is not touched. |
 
-Any status other than `deleted` means **the source file is intact**.
+> [!NOTE]
+> Any status other than 🟢 `deleted` means **the source file is intact**.
 
 ---
 
@@ -268,6 +337,7 @@ Any status other than `deleted` means **the source file is intact**.
 fs-spacemaker scan  --source <folder> --destination <folder>
                     [--mode content|same-path|relocated] [--work-dir <folder>] [--config <file>]
                     [--threads N] [--include-empty-files] [--delete-read-only]
+                    [--ignore-stream NAME]...
 
 fs-spacemaker apply --plan <plan.json> (--confirm <code> | --dry-run)
                     [--config <file>] [--threads N]
@@ -275,7 +345,7 @@ fs-spacemaker apply --plan <plan.json> (--confirm <code> | --dry-run)
 
 ### Configuration file
 
-Copy `fs-spacemaker.config.example.json` as `fs-spacemaker.config.json` **next to the executable**, or pass
+Copy `fs-spacemaker.config.example.json` as `fs-spacemaker.config.json` **in the installation folder**, or pass
 it with `--config`. Every key is optional and unknown keys are rejected, to catch typos. Priority order:
 command line > file > defaults.
 
@@ -289,9 +359,10 @@ command line > file > defaults.
 | `include_empty_files` | false | Also delete empty files (content mode) |
 | `delete_read_only` | false | Also delete read-only files |
 | `remove_emptied_dirs` | true | Remove folders emptied by processing |
-| `work_dir` | `fs-spacemaker-work` next to the executable | Location of the index, plans and reports |
+| `ignored_stream_names` | `[]` | NTFS stream names holding no user data (trailing `*` = prefix), e.g. `["com.dropbox.*"]` |
+| `work_dir` | `fs-spacemaker-work` in the installation folder | Location of the index, plans and reports |
 
-`delete_read_only` and `remove_emptied_dirs` are **frozen into the plan** at scan time, so the report
+`delete_read_only`, `remove_emptied_dirs` and `ignored_stream_names` are **frozen into the plan** at scan time, so the report
 predicts exactly what `apply` will do.
 
 ---
@@ -317,7 +388,7 @@ powershell -ExecutionPolicy Bypass -File .\run-tests.ps1
 The script runs, in order:
 1. the formatting check;
 2. static analysis (Clippy, any warning = failure);
-3. the 110 tests;
+3. the 125 tests;
 4. the release build;
 5. the load test.
 
@@ -326,22 +397,23 @@ It ends with `All checks passed.` or with the list of failed steps.
 Individual commands:
 
 ```powershell
-cargo test                                                  # every suite (110 tests)
+cargo test                                                  # every suite (125 tests)
 cargo test --test windows                                   # Windows-specific tests
 cargo test --release --test stress -- --ignored --nocapture # load test (10,000 files)
 $env:FS_SPACEMAKER_PROPTEST_CASES = "1000"; cargo test --release --test properties   # long property test
 ```
 
-The file symbolic link test only runs in an **elevated** session or with Windows **Developer Mode** on
-(Settings > System > For developers > Developer Mode). Otherwise it is skipped and says so. Junctions are
-always tested.
+> [!NOTE]
+> The file symbolic link test only runs in an **elevated** session or with Windows **Developer Mode** on
+> (Settings > System > For developers > Developer Mode). Otherwise it is skipped and says so. Junctions are
+> always tested.
 
 | Type | File | What is checked |
 |---|---|---|
 | Unit | `src/*.rs` (`mod tests`) | Paths (rejection of `..`, drives, NTFS streams), BLAKE3 (official test vector), byte-by-byte comparison, SQLite index, configuration, plan (any edit is detected), tree matching, folder aggregation, HTML and CSV escaping |
 | Integration | `tests/scan_apply.rs` | The 3 modes, prediction equal to the measured result, large files differing at the last byte, empty files, emptied or already-empty folders, dry run, index reuse, Unicode, paths longer than 260 characters, name case |
 | Safety | `tests/safety.rs` | Nested or identical folders, confirmation code, edited plan, source or destination modified **with the same size and date**, copy deleted between scan and apply, hard link, **junction to the destination**, read-only, unplugged source, applying twice |
-| Windows | `tests/windows.rs` | Source open for writing, file locked without delete sharing, locked destination, file locked during the scan, ADS streams (at scan time and added after the scan), `Zone.Identifier` accepted, hidden and system files, read-only `desktop.ini`, `CON`/`NUL`/`AUX` names and names ending with a dot or a space, file symbolic link, **destination aliased through `subst`, `\\localhost\C$` and a junction (refused)**, `subst` root and network path used as a normal source |
+| Windows | `tests/windows.rs` | Source open for writing, file locked without delete sharing, locked destination, file locked during the scan, ADS streams (missing, different, copied identically, ignored by pattern, changed after the scan), `Zone.Identifier` accepted, hidden and system files, read-only `desktop.ini`, `CON`/`NUL`/`AUX` names and names ending with a dot or a space, file symbolic link, **destination aliased through `subst`, `\\localhost\C$` and a junction (refused)**, `subst` root and network path used as a normal source |
 | Properties | `tests/properties.rs` | Random trees with collisions, in the 3 modes. Checks that the destination is intact, every deleted file had an identical copy, kept files are unchanged, freed space equals the prediction, and nothing deletable is missed (content mode) |
 | End-to-end | `tests/cli.rs` | The real executable: scan, dry run, refusal without a code or with a wrong code, apply, exit codes, invalid configuration |
 | Load | `tests/stress.rs` | 10,000 files with many size collisions (scan ≈ 1.5 s, apply ≈ 2-3 s) |
@@ -350,11 +422,14 @@ always tested.
 
 ## 9. Tips for a first use
 
+> [!TIP]
+> Treat the first run as a rehearsal: a small subfolder, then a dry run, then the real processing.
+
 1. Start with a **subfolder** of the source to get familiar with the report.
 2. Always run the dry run (`--dry-run`) before the real processing.
 3. Before `apply`, close programs that write to the source or destination (OneDrive sync, backups, etc.).
    A modified file is skipped, never deleted, in any case.
-4. Keep the `runs\...` folders: the plan, report and journal document exactly what was done.
+4. Save `apply-journal.csv` elsewhere if you want a permanent record: the next scan replaces it.
 5. On a mechanical hard disk, use `--threads 2` to avoid needless head movement.
 
 ## 10. Architecture (for maintenance)

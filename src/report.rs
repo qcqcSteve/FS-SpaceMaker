@@ -25,9 +25,6 @@ const MAX_REPORT_FOLDERS: usize = 200_000;
 /// Byte-order mark so Excel opens the UTF-8 CSV with accents intact.
 const CSV_UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 const CSV_HEADER: [&str; 6] = ["category", "path", "other_path", "size_bytes", "tag", "detail"];
-/// Report file names inside a run folder.
-pub const HTML_FILE_NAME: &str = "report.html";
-pub const CSV_FILE_NAME: &str = "report.csv";
 
 // ----------------------------------------------------------------------------------------------
 // Model
@@ -371,8 +368,8 @@ mod tests {
             folders: FolderTable::default(),
             tables: vec![table],
         };
-        let html_path = dir.path().join(HTML_FILE_NAME);
-        let csv_path = dir.path().join(CSV_FILE_NAME);
+        let html_path = dir.path().join("report.html");
+        let csv_path = dir.path().join("report.csv");
         write_report(data, 10, &html_path, &csv_path).unwrap();
         let html = fs::read_to_string(&html_path).unwrap();
         assert!(!html.contains(DATA_PLACEHOLDER));

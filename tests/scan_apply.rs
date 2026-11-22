@@ -206,6 +206,42 @@ fn dry_run_verifies_but_deletes_nothing() {
 }
 
 #[test]
+fn each_scan_replaces_the_previous_outputs() {
+    let sandbox = Sandbox::new();
+    sandbox.write_source("dup.txt", b"dup");
+    sandbox.write_destination("dup.txt", b"dup");
+    let first = sandbox.scan(MatchMode::Content);
+    sandbox.dry_run(&first);
+    sandbox.apply(&first);
+    fs::write(sandbox.work.join("my-notes.txt"), b"keep me").unwrap();
+    sandbox.write_source("other.txt", b"other");
+    let second = sandbox.scan(MatchMode::Content);
+    assert_eq!(second.plan_path, first.plan_path, "one plan file, replaced");
+    assert!(second.plan.body.actions.is_empty());
+    let mut names: Vec<String> = fs::read_dir(&sandbox.work)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["index.sqlite", "my-notes.txt", "plan.json", "report.csv", "report.html"]);
+}
+
+#[test]
+fn real_apply_appends_to_its_journal() {
+    let sandbox = Sandbox::new();
+    sandbox.write_source("dup.txt", b"dup");
+    sandbox.write_destination("dup.txt", b"dup");
+    let scan = sandbox.scan(MatchMode::Content);
+    let first = sandbox.apply(&scan);
+    let second = sandbox.apply(&scan);
+    assert_eq!(first.journal_path, second.journal_path);
+    let journal = fs::read_to_string(&second.journal_path).unwrap();
+    assert_eq!(journal.lines().filter(|line| line.starts_with("timestamp,")).count(), 1, "one header");
+    assert!(journal.contains(",deleted,"), "the deletion of the first run is kept");
+    assert!(journal.contains(",skipped-source-missing,"));
+}
+
+#[test]
 fn second_scan_reuses_the_index() {
     let sandbox = Sandbox::new();
     sandbox.write_source("a.bin", &vec![1u8; 200_000]);

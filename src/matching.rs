@@ -79,7 +79,9 @@ impl ResidualReason {
             (Self::NotInMatchedTree, _) => "identical copy exists, but its folder is not complete elsewhere",
             (Self::ReadOnly, _) => "read-only file: protected (see delete_read_only)",
             (Self::SameFile, _) => "source and destination are the same physical file (hard link)",
-            (Self::AlternateStreams, _) => "has NTFS alternate data streams (hidden data): protected",
+            (Self::AlternateStreams, _) => {
+                "hidden NTFS stream missing or different on the destination copy: protected"
+            }
         }
     }
 }

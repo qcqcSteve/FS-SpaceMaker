@@ -13,18 +13,18 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::fingerprint::{Fingerprints, HashStats, HashingRuntime};
-use crate::format::{format_bytes, timestamp_for_path, timestamp_iso};
+use crate::format::{format_bytes, timestamp_iso};
 use crate::hashing::to_hex;
 use crate::index::{HashIndex, INDEX_FILE_NAME};
 use crate::inventory::{Inventory, WalkOptions, scan_tree};
 use crate::matching::{FileMatch, MatchContext, MatchMode, MatchOutcome, ResidualReason, match_files};
+use crate::outputs::{PLAN_FILE_NAME, SCAN_CSV_FILE_NAME, SCAN_HTML_FILE_NAME, clear_previous_outputs};
 use crate::paths::{canonical_root, display_joined, display_path, ensure_disjoint_roots, is_same_or_inside};
-use crate::plan::{PLAN_FILE_NAME, Plan, PlanBody, PlannedDeletion, write_plan};
-use crate::platform::has_meaningful_streams;
+use crate::plan::{Plan, PlanBody, PlannedDeletion, write_plan};
+use crate::platform::{StreamCheck, check_streams};
 use crate::progress::{ProgressMeter, print_step};
 use crate::report::{
-    CSV_FILE_NAME, Card, FolderFile, HTML_FILE_NAME, Phase, ReportData, ReportRow, Table, Tone, VolumeBar,
-    aggregate_folders, write_report,
+    Card, FolderFile, Phase, ReportData, ReportRow, Table, Tone, VolumeBar, aggregate_folders, write_report,
 };
 use crate::space::{VolumeSpace, volume_space};
 
@@ -32,10 +32,6 @@ use crate::space::{VolumeSpace, volume_space};
 // Configuration
 // ----------------------------------------------------------------------------------------------
 
-/// Sub-folder of the work folder holding one folder per scan.
-pub const RUNS_DIR_NAME: &str = "runs";
-/// Highest numeric suffix tried when two scans start in the same second.
-const MAX_RUN_DIR_SUFFIX: u32 = 100;
 /// Program version recorded in plans and reports.
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Hex characters of the digest shown in the deletion table.
@@ -90,7 +86,7 @@ impl ScanSummary {
 pub struct ScanOutput {
     pub plan: Plan,
     pub summary: ScanSummary,
-    pub run_dir: PathBuf,
+    pub output_dir: PathBuf,
     pub plan_path: PathBuf,
     pub html_path: PathBuf,
     pub csv_path: PathBuf,
@@ -130,20 +126,22 @@ pub fn run_scan(request: &ScanRequest) -> Result<ScanOutput> {
     let mut findings = ScanFindings { source, destination, outcome: MatchOutcome::default() };
     let (plan, stats) = fingerprint_and_plan(request, &roots, &mut findings)?;
     print_step("Writing plan and report");
-    let run_dir = create_run_dir(&roots.work_dir, request.mode)?;
-    let plan_path = run_dir.join(PLAN_FILE_NAME);
+    // One set of outputs: the previous plan and reports are replaced.
+    clear_previous_outputs(&roots.work_dir)?;
+    let output_dir = roots.work_dir.clone();
+    let plan_path = output_dir.join(PLAN_FILE_NAME);
     write_plan(&plan, &plan_path)?;
     let summary = summarize(&findings);
     let apply_command = apply_command_for(&plan_path, &plan);
-    let html_path = run_dir.join(HTML_FILE_NAME);
-    let csv_path = run_dir.join(CSV_FILE_NAME);
+    let html_path = output_dir.join(SCAN_HTML_FILE_NAME);
+    let csv_path = output_dir.join(SCAN_CSV_FILE_NAME);
     let data = build_report(request, &findings, &summary, &plan, &apply_command);
     write_report(data, request.config.report_max_rows, &html_path, &csv_path)?;
     let (source_stats, destination_stats) = stats;
     Ok(ScanOutput {
         plan,
         summary,
-        run_dir,
+        output_dir,
         plan_path,
         html_path,
         csv_path,
@@ -228,7 +226,7 @@ fn fingerprint_and_plan(
     };
     let mut outcome = match_files(&mut context);
     meter.print_line();
-    apply_safety_filters(&mut outcome, findings, config.delete_read_only, &pool);
+    apply_safety_filters(&mut outcome, findings, config, &pool);
     index.store_root(&source_key, &source_prints.rows_to_index())?;
     index.store_root(&destination_key, &destination_prints.rows_to_index())?;
     let plan = build_plan(request, findings, &outcome, &source_prints)?;
@@ -242,19 +240,16 @@ pub fn build_pool(threads: usize) -> Result<ThreadPool> {
     rayon::ThreadPoolBuilder::new().num_threads(threads).build().context("Cannot start worker threads")
 }
 
-/// Moves matches that must not be deleted (read-only, same physical file) to the residual.
+/// Moves matches that must not be deleted (read-only, same physical file, uncopied streams) to
+/// the residual.
 fn apply_safety_filters(
     outcome: &mut MatchOutcome,
     findings: &ScanFindings,
-    delete_read_only: bool,
+    config: &Config,
     pool: &ThreadPool,
 ) {
     let rejections: Vec<Option<ResidualReason>> = pool.install(|| {
-        outcome
-            .matches
-            .par_iter()
-            .map(|file_match| safety_rejection(file_match, findings, delete_read_only))
-            .collect()
+        outcome.matches.par_iter().map(|file_match| safety_rejection(file_match, findings, config)).collect()
     });
     let mut kept = Vec::with_capacity(outcome.matches.len());
     for (file_match, rejection) in outcome.matches.iter().zip(rejections) {
@@ -271,21 +266,21 @@ fn apply_safety_filters(
 fn safety_rejection(
     file_match: &FileMatch,
     findings: &ScanFindings,
-    delete_read_only: bool,
+    config: &Config,
 ) -> Option<ResidualReason> {
-    if findings.source.files[file_match.source].is_read_only && !delete_read_only {
+    if findings.source.files[file_match.source].is_read_only && !config.delete_read_only {
         return Some(ResidualReason::ReadOnly);
     }
     let source_path = findings.source.path_of(file_match.source);
     let destination_path = findings.destination.path_of(file_match.destination);
-    match same_file::is_same_file(&source_path, destination_path) {
+    match same_file::is_same_file(&source_path, &destination_path) {
         Ok(false) => {}
         Ok(true) => return Some(ResidualReason::SameFile),
         Err(_) => return Some(ResidualReason::Unreadable),
     }
-    match has_meaningful_streams(&source_path) {
-        Ok(false) => None,
-        Ok(true) => Some(ResidualReason::AlternateStreams),
+    match check_streams(&source_path, &destination_path, &config.ignored_stream_names) {
+        Ok(StreamCheck::Covered) => None,
+        Ok(StreamCheck::Uncovered(_)) => Some(ResidualReason::AlternateStreams),
         Err(_) => Some(ResidualReason::Unreadable),
     }
 }
@@ -322,6 +317,7 @@ fn build_plan(
         destination_root: root_text(&findings.destination.root)?,
         delete_read_only: request.config.delete_read_only,
         remove_emptied_dirs: request.config.remove_emptied_dirs,
+        ignored_stream_names: request.config.ignored_stream_names.clone(),
         actions,
     })
 }
@@ -329,22 +325,6 @@ fn build_plan(
 /// Returns a canonical root as text (roots were checked to be valid Unicode).
 fn root_text(root: &Path) -> Result<String> {
     root.to_str().map(str::to_string).context("Root path is not valid Unicode")
-}
-
-/// Creates a new, uniquely named run folder.
-fn create_run_dir(work_dir: &Path, mode: MatchMode) -> Result<PathBuf> {
-    let base = format!("{}-{}", timestamp_for_path(), mode.tag());
-    let runs = work_dir.join(RUNS_DIR_NAME);
-    for suffix in 1..=MAX_RUN_DIR_SUFFIX {
-        let name = if suffix == 1 { base.clone() } else { format!("{base}-{suffix}") };
-        let candidate = runs.join(name);
-        if !candidate.exists() {
-            fs::create_dir_all(&candidate)
-                .with_context(|| format!("Cannot create {}", candidate.display()))?;
-            return Ok(candidate);
-        }
-    }
-    bail!("Cannot create a unique run folder under {}: clean it up.", runs.display())
 }
 
 /// Returns the command line that applies the plan.
