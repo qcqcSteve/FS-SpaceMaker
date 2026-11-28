@@ -7,14 +7,18 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::paths::is_valid_name_pattern;
+
 // ----------------------------------------------------------------------------------------------
 // Configuration
 // ----------------------------------------------------------------------------------------------
 
 /// Name of the optional configuration file looked up in the installation folder.
 pub const CONFIG_FILE_NAME: &str = "fs-spacemaker.config.json";
-/// Name of the default work folder (index, plans, reports) created in the installation folder.
+/// Name of the default work folder (fingerprint index) created in the installation folder.
 pub const DEFAULT_WORK_DIR_NAME: &str = "fs-spacemaker-work";
+/// Name of the default reports folder (plan, reports, journals) created in the installation folder.
+pub const DEFAULT_REPORTS_DIR_NAME: &str = "reports";
 /// Cargo output layout: an executable in target\release or target\debug belongs to the project
 /// folder above `target`, which is where its work folder and configuration file live.
 const CARGO_TARGET_DIR_NAME: &str = "target";
@@ -29,12 +33,15 @@ const DEFAULT_REPORT_MAX_ROWS: usize = 50_000;
 const MAX_DEFAULT_SCAN_THREADS: usize = 8;
 /// Default number of parallel verifications during apply.
 const DEFAULT_APPLY_THREADS: usize = 4;
-/// Characters not allowed in an ignored stream pattern ('*' is only allowed as the last character).
-const FORBIDDEN_STREAM_PATTERN_CHARS: [char; 4] = ['*', ':', '\\', '/'];
-/// Names never inventoried, on either side (compared case-insensitively).
-const DEFAULT_EXCLUDED_NAMES: [&str; 6] = [
+/// Names never inventoried, on either side (case-insensitive, a trailing '*' matches a prefix).
+/// Trash folders are excluded so a file in a trash is never taken as the copy that justifies a
+/// deletion: trashes get emptied.
+const DEFAULT_EXCLUDED_NAMES: [&str; 9] = [
     "System Volume Information",
     "$RECYCLE.BIN",
+    "RECYCLER",
+    ".Trash-*",
+    ".Trashes",
     "pagefile.sys",
     "hiberfil.sys",
     "swapfile.sys",
@@ -61,7 +68,9 @@ pub struct Config {
     pub delete_read_only: bool,
     pub remove_emptied_dirs: bool,
     pub ignored_stream_names: Vec<String>,
+    pub remove_svn_metadata: bool,
     pub work_dir: Option<PathBuf>,
+    pub reports_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -77,7 +86,9 @@ impl Default for Config {
             delete_read_only: false,
             remove_emptied_dirs: true,
             ignored_stream_names: Vec::new(),
+            remove_svn_metadata: false,
             work_dir: None,
+            reports_dir: None,
         }
     }
 }
@@ -94,22 +105,18 @@ impl Config {
         if self.report_max_rows == 0 {
             bail!("report_max_rows must be at least 1: fix the configuration.");
         }
-        if let Some(pattern) =
-            self.ignored_stream_names.iter().find(|pattern| !is_valid_stream_pattern(pattern))
-        {
-            bail!(
-                "Invalid ignored stream name {pattern:?}: use a stream name, optionally ending with '*' \
-                 (e.g. com.dropbox.*)."
-            );
+        let lists =
+            [("ignored stream name", &self.ignored_stream_names), ("excluded name", &self.excluded_names)];
+        for (label, patterns) in lists {
+            if let Some(pattern) = patterns.iter().find(|pattern| !is_valid_name_pattern(pattern)) {
+                bail!(
+                    "Invalid {label} {pattern:?}: use a name, optionally ending with '*' to match a \
+                     prefix (e.g. com.dropbox.* or .Trash-*)."
+                );
+            }
         }
         Ok(())
     }
-}
-
-/// Returns true if a stream pattern is a non-empty name with at most one '*', at its end.
-fn is_valid_stream_pattern(pattern: &str) -> bool {
-    let name = pattern.strip_suffix('*').unwrap_or(pattern);
-    !name.is_empty() && !name.contains(FORBIDDEN_STREAM_PATTERN_CHARS)
 }
 
 /// Returns the number of logical CPUs, capped for disk-bound work.
@@ -167,12 +174,22 @@ fn installation_dir_for(executable_dir: &Path) -> PathBuf {
 
 /// Returns the configured work folder, or the default one in the installation folder.
 pub fn resolve_work_dir(config: &Config) -> Result<PathBuf> {
-    if let Some(dir) = &config.work_dir {
+    resolve_dir(config.work_dir.as_ref(), DEFAULT_WORK_DIR_NAME, "--work-dir")
+}
+
+/// Returns the configured reports folder, or the default one in the installation folder.
+pub fn resolve_reports_dir(config: &Config) -> Result<PathBuf> {
+    resolve_dir(config.reports_dir.as_ref(), DEFAULT_REPORTS_DIR_NAME, "--reports-dir")
+}
+
+/// Returns the configured folder, or the named folder in the installation folder.
+fn resolve_dir(configured: Option<&PathBuf>, default_name: &str, option: &str) -> Result<PathBuf> {
+    if let Some(dir) = configured {
         return Ok(dir.clone());
     }
     installation_dir()
-        .map(|dir| dir.join(DEFAULT_WORK_DIR_NAME))
-        .context("Cannot locate the executable folder: pass --work-dir.")
+        .map(|dir| dir.join(default_name))
+        .with_context(|| format!("Cannot locate the executable folder: pass {option}."))
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -190,6 +207,8 @@ mod tests {
         assert!(!config.delete_read_only);
         assert!(!config.include_empty_files);
         assert!(config.remove_emptied_dirs);
+        assert!(!config.remove_svn_metadata);
+        assert!(config.excluded_names.iter().any(|name| name == ".Trash-*"));
     }
 
     #[test]
@@ -239,7 +258,20 @@ mod tests {
         for bad in ["", "*", "a*b", "a:b", "*.txt"] {
             let config = Config { ignored_stream_names: vec![bad.to_string()], ..Config::default() };
             assert!(config.validate().is_err(), "{bad:?} should be rejected");
+            let config = Config { excluded_names: vec![bad.to_string()], ..Config::default() };
+            assert!(config.validate().is_err(), "{bad:?} should be rejected as an excluded name");
         }
+    }
+
+    #[test]
+    fn reports_and_index_have_separate_default_folders() {
+        let config = Config::default();
+        let reports = resolve_reports_dir(&config).unwrap();
+        let work = resolve_work_dir(&config).unwrap();
+        assert!(reports.ends_with(DEFAULT_REPORTS_DIR_NAME));
+        assert_eq!(reports.parent(), work.parent(), "both live in the installation folder");
+        let chosen = Config { reports_dir: Some(PathBuf::from("elsewhere")), ..Config::default() };
+        assert_eq!(resolve_reports_dir(&chosen).unwrap(), PathBuf::from("elsewhere"));
     }
 
     #[test]

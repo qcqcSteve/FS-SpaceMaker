@@ -1,6 +1,8 @@
-//! Fixed names of the files written into the work folder. There is a single set of outputs: each
+//! Fixed names of the files written into the reports folder. There is a single set of outputs: each
 //! scan replaces the previous plan and reports, each dry run replaces the previous dry-run files.
-//! Only these exact names are ever removed, never anything else in the work folder.
+//! The journal of real deletions is the one exception: it is never removed, only appended to, so
+//! the trace of every file ever deleted survives later scans. Only these exact names are ever
+//! removed, never anything else in the reports folder.
 
 use std::fs;
 use std::io;
@@ -58,15 +60,21 @@ pub fn apply_paths(output_dir: &Path, is_dry_run: bool) -> ApplyPaths {
     }
 }
 
-/// Removes the outputs of the previous scan and of its dry runs and applies.
-pub fn clear_previous_outputs(work_dir: &Path) -> Result<()> {
-    let names = [PLAN_FILE_NAME, SCAN_HTML_FILE_NAME, SCAN_CSV_FILE_NAME].into_iter().chain(
-        [DRY_RUN_FILE_NAMES, APPLY_FILE_NAMES]
-            .into_iter()
-            .flat_map(|phase| [phase.html, phase.csv, phase.journal]),
-    );
+/// Removes the outputs of the previous scan and of its dry runs and applies, except the journal
+/// of real deletions.
+pub fn clear_previous_outputs(reports_dir: &Path) -> Result<()> {
+    let names = [
+        PLAN_FILE_NAME,
+        SCAN_HTML_FILE_NAME,
+        SCAN_CSV_FILE_NAME,
+        DRY_RUN_FILE_NAMES.html,
+        DRY_RUN_FILE_NAMES.csv,
+        DRY_RUN_FILE_NAMES.journal,
+        APPLY_FILE_NAMES.html,
+        APPLY_FILE_NAMES.csv,
+    ];
     for name in names {
-        remove_if_present(&work_dir.join(name))?;
+        remove_if_present(&reports_dir.join(name))?;
     }
     Ok(())
 }
@@ -93,8 +101,8 @@ mod tests {
     #[test]
     fn clears_only_known_outputs() {
         let dir = tempfile::tempdir().unwrap();
-        let known = [PLAN_FILE_NAME, SCAN_HTML_FILE_NAME, "dry-run-journal.csv", "apply-journal.csv"];
-        for name in known.iter().chain(&["index.sqlite", "notes.txt"]) {
+        let known = [PLAN_FILE_NAME, SCAN_HTML_FILE_NAME, "dry-run-journal.csv", "apply-report.html"];
+        for name in known.iter().chain(&["index.sqlite", "notes.txt", "apply-journal.csv"]) {
             fs::write(dir.path().join(name), b"x").unwrap();
         }
         clear_previous_outputs(dir.path()).unwrap();
@@ -102,6 +110,7 @@ mod tests {
             assert!(!dir.path().join(name).exists(), "{name} should be removed");
         }
         assert!(dir.path().join("index.sqlite").exists(), "the index is kept");
+        assert!(dir.path().join("apply-journal.csv").exists(), "the deletion journal is never removed");
         assert!(dir.path().join("notes.txt").exists(), "unknown files are never touched");
     }
 

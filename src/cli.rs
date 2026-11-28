@@ -1,5 +1,5 @@
 //! Command-line interface: parses arguments, merges them over the configuration and prints results.
-//! Usage: fs-spacemaker scan --source <dir> --destination <dir> [--mode content|same-path|relocated]
+//! Usage: fs-spacemaker scan --source <dir> --destination <dir> [--mode content|same-path|relocated|merge]
 //!        fs-spacemaker apply --plan <plan.json> (--confirm <code> | --dry-run)
 
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 use crate::apply::{ActionStatus, ApplyOutput, ApplyRequest, run_apply};
-use crate::config::{Config, load_config, resolve_work_dir};
+use crate::config::{Config, load_config, resolve_reports_dir, resolve_work_dir};
 use crate::format::format_bytes;
 use crate::matching::MatchMode;
 use crate::paths::display_path;
@@ -51,15 +51,19 @@ struct ScanArgs {
     /// Folder or drive to keep (never modified).
     #[arg(long)]
     destination: PathBuf,
-    /// How a source file must correspond to a destination file.
+    /// How a source file must correspond to a destination file ("merge" also moves every other
+    /// source file into the destination, leaving the source empty).
     #[arg(long, value_enum, default_value_t = MatchMode::Content)]
     mode: MatchMode,
     /// Configuration file (default: fs-spacemaker.config.json in the installation folder, if present).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Folder for the index, plans and reports (default: fs-spacemaker-work in the installation folder).
+    /// Folder for the fingerprint index (default: fs-spacemaker-work in the installation folder).
     #[arg(long)]
     work_dir: Option<PathBuf>,
+    /// Folder for the plan, reports and journals (default: reports in the installation folder).
+    #[arg(long)]
+    reports_dir: Option<PathBuf>,
     /// Parallel file reads.
     #[arg(long)]
     threads: Option<usize>,
@@ -73,6 +77,9 @@ struct ScanArgs {
     /// matches a prefix, e.g. --ignore-stream "com.dropbox.*").
     #[arg(long = "ignore-stream", value_name = "NAME")]
     ignored_streams: Vec<String>,
+    /// Also remove Subversion metadata (.svn) once every file of its working copy is deleted.
+    #[arg(long)]
+    remove_svn_metadata: bool,
 }
 
 #[derive(Debug, Args)]
@@ -115,13 +122,24 @@ fn run_scan_command(args: ScanArgs) -> Result<ExitCode> {
     if let Some(dir) = args.work_dir {
         config.work_dir = Some(dir);
     }
+    if let Some(dir) = args.reports_dir {
+        config.reports_dir = Some(dir);
+    }
     config.include_empty_files |= args.include_empty_files;
     config.delete_read_only |= args.delete_read_only;
+    config.remove_svn_metadata |= args.remove_svn_metadata;
     config.ignored_stream_names.extend(args.ignored_streams);
     config.validate()?;
     let work_dir = resolve_work_dir(&config)?;
-    let request =
-        ScanRequest { source: args.source, destination: args.destination, mode: args.mode, config, work_dir };
+    let reports_dir = resolve_reports_dir(&config)?;
+    let request = ScanRequest {
+        source: args.source,
+        destination: args.destination,
+        mode: args.mode,
+        config,
+        work_dir,
+        reports_dir,
+    };
     let output = run_scan(&request)?;
     print_scan_summary(&output);
     Ok(ExitCode::SUCCESS)
@@ -132,6 +150,16 @@ fn print_scan_summary(output: &ScanOutput) {
     let summary = &output.summary;
     print_step("Result (nothing deleted)");
     println!("  will be freed:     {} files, {}", summary.delete_files, format_bytes(summary.delete_bytes));
+    if summary.move_files > 0 {
+        println!("  will be moved:     {} files, {}", summary.move_files, format_bytes(summary.move_bytes));
+    }
+    if summary.metadata_removal_bytes > 0 {
+        println!(
+            "  plus svn metadata: {} folders, {}",
+            output.plan.body.metadata_removals.len(),
+            format_bytes(summary.metadata_removal_bytes)
+        );
+    }
     println!(
         "  remains on source: {} files, {}",
         summary.residual_files,
@@ -177,8 +205,17 @@ fn print_apply_summary(output: &ApplyOutput) {
     print_step(if output.is_dry_run { "Result (dry run: nothing deleted)" } else { "Result" });
     let verb = if output.is_dry_run { "would delete" } else { "deleted" };
     println!("  {verb}: {files} files, {}", format_bytes(bytes));
+    if !output.plan.body.moves.is_empty() {
+        let (moved_files, moved_bytes) = output.moved_totals();
+        let verb = if output.is_dry_run { "would move" } else { "moved" };
+        println!("  {verb}: {moved_files} files, {}", format_bytes(moved_bytes));
+    }
     println!("  skipped by safety checks: {}", output.skipped_count());
     println!("  failed: {}", output.count(ActionStatus::Failed));
+    if !output.plan.body.metadata_removals.is_empty() {
+        let label = if output.is_dry_run { "would remove" } else { "removed" };
+        println!("  svn metadata {label}: {}", output.metadata_removals().count());
+    }
     if !output.is_dry_run {
         println!("  emptied folders removed: {}", output.removed_dirs.len());
         if let Some(free) = output.space_after.available {

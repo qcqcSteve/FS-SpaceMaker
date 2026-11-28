@@ -1,6 +1,8 @@
 //! Platform-specific file system safety helpers (Windows first, neutral fallbacks elsewhere):
-//! opening a source file so nobody can write to it until it is deleted, checking that NTFS
-//! alternate data streams are copied on the destination, cloud placeholders and "file in use" errors.
+//! opening source and destination files so nobody can change them until the source is deleted,
+//! deleting through the verified handle, checking delete rights, checking that NTFS alternate data
+//! streams are copied on the destination, cloud placeholders and "in use" / "access denied" errors,
+//! and moving files (merge mode) without ever replacing an existing destination entry.
 
 use std::fs::{File, Metadata};
 use std::io;
@@ -8,6 +10,7 @@ use std::path::Path;
 
 #[cfg(windows)]
 use crate::hashing::compare_files;
+use crate::paths::matches_name_pattern;
 
 // ----------------------------------------------------------------------------------------------
 // Configuration
@@ -23,6 +26,8 @@ const IN_USE_ERROR_CODES: [i32; 2] = [32, 33];
 const HARMLESS_STREAM_NAMES: [&str; 2] = ["", "Zone.Identifier"];
 /// Suffix of every data stream name returned by Windows (":name:$DATA").
 const STREAM_TYPE_SUFFIX: &str = ":$DATA";
+/// Error codes of a rename between two volumes: ERROR_NOT_SAME_DEVICE (Windows), EXDEV (Unix).
+const CROSS_DEVICE_ERROR_CODE: i32 = if cfg!(windows) { 17 } else { 18 };
 
 // ----------------------------------------------------------------------------------------------
 // Cloud placeholders
@@ -47,27 +52,224 @@ pub fn is_cloud_placeholder(_metadata: &Metadata) -> bool {
 }
 
 // ----------------------------------------------------------------------------------------------
-// Locking
+// Locking and deletion through the verified handle
 // ----------------------------------------------------------------------------------------------
 
-/// Opens a source file for reading while forbidding other writers until the handle is closed.
-/// Deletion stays allowed so the file can be deleted while still locked against writes.
+/// Opens a source file for reading and deletion. Other programs may still read it, but none can
+/// write, rename or delete it until the handle is closed, so the file finally deleted is exactly
+/// the one verified. A link is opened as a link, never followed.
 #[cfg(windows)]
-pub fn open_source_locked(path: &Path) -> io::Result<File> {
+pub fn open_source_for_deletion(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
-    File::options().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE).open(path)
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ,
+    };
+    File::options()
+        .access_mode(FILE_GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 /// Opens a source file for reading (no mandatory locking on this platform).
 #[cfg(not(windows))]
-pub fn open_source_locked(path: &Path) -> io::Result<File> {
+pub fn open_source_for_deletion(path: &Path) -> io::Result<File> {
     File::open(path)
+}
+
+/// Opens a destination file for reading while forbidding writers, renames and deletion until the
+/// handle is closed: the copy cannot change between the comparison and the source deletion.
+#[cfg(windows)]
+pub fn open_destination_locked(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+    File::options()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// Opens a destination file for reading (no mandatory locking on this platform).
+#[cfg(not(windows))]
+pub fn open_destination_locked(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+/// Checks that the current user is allowed to delete a file, without reading, locking or
+/// changing it (protected system files refuse the DELETE access right).
+#[cfg(windows)]
+pub fn probe_delete_access(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+    File::options()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map(drop)
+}
+
+/// Accepts every file: deletion rights are checked by the deletion itself on this platform.
+#[cfg(not(windows))]
+pub fn probe_delete_access(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Deletes the file behind a handle from `open_source_for_deletion`. The name disappears at once
+/// (POSIX semantics) where the volume supports it; elsewhere it disappears when the handle closes.
+#[cfg(windows)]
+pub fn delete_open_file(file: File, path: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+        FileDispositionInfo, FileDispositionInfoEx,
+    };
+    let extended = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE
+            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    let error = match set_disposition(&file, FileDispositionInfoEx, &extended) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if !is_unsupported_error(&error) {
+        return Err(error);
+    }
+    // Older Windows or FAT/exFAT volumes: classic disposition, read-only attribute cleared first.
+    clear_read_only(path)?;
+    set_disposition(&file, FileDispositionInfo, &FILE_DISPOSITION_INFO { DeleteFile: true })
+}
+
+/// Deletes the file by path (no deletion through a handle on this platform).
+#[cfg(not(windows))]
+pub fn delete_open_file(file: File, path: &Path) -> io::Result<()> {
+    drop(file);
+    std::fs::remove_file(path)
+}
+
+/// Applies one disposition structure to an open file.
+#[cfg(windows)]
+fn set_disposition<T>(
+    file: &File,
+    class: windows_sys::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS,
+    info: &T,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
+    let size = u32::try_from(size_of::<T>()).map_err(io::Error::other)?;
+    // SAFETY: the handle is open for the lifetime of `file`, `info` points to `size` readable bytes
+    // of the structure matching `class`.
+    let is_done =
+        unsafe { SetFileInformationByHandle(file.as_raw_handle(), class, (&raw const *info).cast(), size) };
+    if is_done == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// Clears the read-only attribute of a file if it is set.
+#[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
+fn clear_read_only(path: &Path) -> io::Result<()> {
+    let mut permissions = std::fs::symlink_metadata(path)?.permissions();
+    if !permissions.readonly() {
+        return Ok(());
+    }
+    // On Windows this only clears FILE_ATTRIBUTE_READONLY.
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions)
+}
+
+/// Returns true for errors meaning "this request is not supported by this volume or system".
+#[cfg(windows)]
+fn is_unsupported_error(error: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    };
+    let codes = [ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED];
+    error.raw_os_error().is_some_and(|code| codes.iter().any(|&known| i64::from(known) == i64::from(code)))
 }
 
 /// Returns true if an error means another program is using the file.
 pub fn is_in_use_error(error: &io::Error) -> bool {
     cfg!(windows) && error.raw_os_error().is_some_and(|code| IN_USE_ERROR_CODES.contains(&code))
+}
+
+/// Returns true if an error means the current user has no right to perform the operation.
+pub fn is_access_denied_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
+}
+
+// ----------------------------------------------------------------------------------------------
+// Moving files
+// ----------------------------------------------------------------------------------------------
+
+/// Renames a file, failing with `AlreadyExists` instead of replacing an existing entry (the
+/// standard rename replaces it). Fails with a cross-device error between two volumes.
+#[cfg(windows)]
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    let wide =
+        |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
+    let (from_wide, to_wide) = (wide(from), wide(to));
+    // SAFETY: both buffers are NUL-terminated UTF-16 strings that outlive the call. Without
+    // MOVEFILE_REPLACE_EXISTING an existing target is never replaced.
+    let is_done = unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if is_done == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// Renames a file without replacing an existing entry: a new hard link, then the old name removed.
+#[cfg(not(windows))]
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    std::fs::remove_file(from)
+}
+
+/// Returns true if a rename failed only because both paths are on different volumes.
+pub fn is_cross_device_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::CrossesDevices || error.raw_os_error() == Some(CROSS_DEVICE_ERROR_CODE)
+}
+
+/// Returns true if an operation failed because its target already exists.
+pub fn is_already_exists_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::AlreadyExists
+}
+
+/// Copies a file with its modification time and, on Windows, its attributes and alternate data
+/// streams (the standard copy uses CopyFileExW there). An existing `to` is replaced: callers copy
+/// to a private temporary name only.
+pub fn copy_preserving_metadata(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::copy(from, to)?;
+    preserve_modified_time(from, to)
+}
+
+/// Windows: CopyFileExW already kept the modification time.
+#[cfg(windows)]
+fn preserve_modified_time(_from: &Path, _to: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Gives the copy the modification time of the original (the standard copy does not keep it).
+#[cfg(not(windows))]
+fn preserve_modified_time(from: &Path, to: &Path) -> io::Result<()> {
+    let modified = std::fs::metadata(from)?.modified()?;
+    File::open(to)?.set_modified(modified)
+}
+
+/// Removes a file even if it is read-only; a file already gone counts as removed.
+pub fn remove_file_forcing(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    match clear_read_only(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        result => result?,
+    }
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -88,21 +290,11 @@ pub fn bare_stream_name(raw: &str) -> &str {
     raw.strip_prefix(':').and_then(|rest| rest.strip_suffix(STREAM_TYPE_SUFFIX)).unwrap_or(raw)
 }
 
-/// Returns true if a bare stream name matches a pattern (case-insensitive, trailing '*' = prefix).
-pub fn matches_stream_pattern(name: &str, pattern: &str) -> bool {
-    let name = name.to_lowercase();
-    let pattern = pattern.to_lowercase();
-    match pattern.strip_suffix('*') {
-        Some(prefix) => name.starts_with(prefix),
-        None => name == pattern,
-    }
-}
-
 /// Returns true if a stream may hold user data: not the main stream, not the download origin
 /// mark, and not declared ignorable by the user.
 pub fn is_meaningful_stream(bare_name: &str, ignored_patterns: &[String]) -> bool {
     let is_harmless = HARMLESS_STREAM_NAMES.iter().any(|harmless| harmless.eq_ignore_ascii_case(bare_name));
-    !is_harmless && !ignored_patterns.iter().any(|pattern| matches_stream_pattern(bare_name, pattern))
+    !is_harmless && !ignored_patterns.iter().any(|pattern| matches_name_pattern(bare_name, pattern))
 }
 
 /// Checks that every meaningful stream of the source exists, byte-identical, on the destination.
@@ -189,11 +381,8 @@ fn list_streams(path: &Path) -> io::Result<Vec<String>> {
 /// Returns true for errors that mean "no (more) streams" or "streams not supported here" (FAT).
 #[cfg(windows)]
 fn is_streamless_error(error: &io::Error, end_of_list: u32) -> bool {
-    use windows_sys::Win32::Foundation::{
-        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
-    };
-    let codes = [end_of_list, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED];
-    error.raw_os_error().is_some_and(|code| codes.iter().any(|&known| i64::from(known) == i64::from(code)))
+    let is_end = error.raw_os_error().is_some_and(|code| i64::from(code) == i64::from(end_of_list));
+    is_end || is_unsupported_error(error)
 }
 
 /// Decodes the stream name of a find record.
@@ -299,15 +488,87 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn locked_source_rejects_writers_but_allows_deletion() {
+    fn source_handle_blocks_writers_renames_and_deletes_until_it_deletes_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("locked.txt");
         std::fs::write(&path, b"data").unwrap();
-        let handle = open_source_locked(&path).unwrap();
+        let handle = open_source_for_deletion(&path).unwrap();
         let writer = File::options().write(true).open(&path);
         assert!(writer.as_ref().is_err_and(is_in_use_error), "writers must be refused: {writer:?}");
-        std::fs::remove_file(&path).unwrap();
-        drop(handle);
+        assert!(std::fs::rename(&path, dir.path().join("moved.txt")).is_err(), "renames must be refused");
+        assert!(std::fs::remove_file(&path).is_err(), "other deletions must be refused");
+        assert!(File::open(&path).is_ok(), "readers are still allowed");
+        delete_open_file(handle, &path).unwrap();
         assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_only_files_are_deleted_through_the_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-only.txt");
+        std::fs::write(&path, b"data").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        delete_open_file(open_source_for_deletion(&path).unwrap(), &path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn destination_handle_blocks_writers_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy.txt");
+        std::fs::write(&path, b"data").unwrap();
+        let handle = open_destination_locked(&path).unwrap();
+        assert!(File::options().write(true).open(&path).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        drop(handle);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn rename_never_replaces_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from.txt");
+        let to = dir.path().join("to.txt");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        let error = rename_no_replace(&from, &to).unwrap_err();
+        assert!(is_already_exists_error(&error), "{error:?}");
+        assert_eq!(std::fs::read(&to).unwrap(), b"old");
+        std::fs::remove_file(&to).unwrap();
+        rename_no_replace(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        assert!(!from.exists());
+    }
+
+    #[test]
+    fn copies_keep_the_modification_time_and_read_only_copies_can_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from.txt");
+        let to = dir.path().join("to.txt");
+        std::fs::write(&from, b"data").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        File::options().write(true).open(&from).unwrap().set_modified(old).unwrap();
+        let mut permissions = std::fs::metadata(&from).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&from, permissions).unwrap();
+        copy_preserving_metadata(&from, &to).unwrap();
+        assert_eq!(std::fs::metadata(&to).unwrap().modified().unwrap(), old);
+        remove_file_forcing(&to).unwrap();
+        remove_file_forcing(&to).unwrap();
+        assert!(!to.exists());
+        remove_file_forcing(&from).unwrap();
+    }
+
+    #[test]
+    fn delete_access_is_granted_on_ordinary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, b"data").unwrap();
+        probe_delete_access(&path).unwrap();
+        assert!(path.exists(), "probing never deletes");
     }
 }

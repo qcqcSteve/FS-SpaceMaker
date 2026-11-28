@@ -1,4 +1,4 @@
-//! The plan: the exact, frozen list of deletions proposed by a scan. Its identifier is the BLAKE3
+//! The plan: the exact, frozen list of deletions (and, in merge mode, moves) proposed by a scan. Its identifier is the BLAKE3
 //! digest of its body, so any edit or corruption is detected, and apply requires the first
 //! characters of that identifier as a confirmation code.
 
@@ -30,7 +30,66 @@ pub struct PlannedDeletion {
     pub destination_rel: String,
     pub size: u64,
     pub source_mtime_ns: i64,
+    /// Digest of the content proven identical; empty (and omitted) in merge mode, which pairs files
+    /// by name and size only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub blake3: String,
+}
+
+/// One source file to move into the destination (merge mode), to a path that was free at scan time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedMove {
+    pub source_rel: String,
+    pub destination_rel: String,
+    pub size: u64,
+    pub source_mtime_ns: i64,
+}
+
+/// What every planned file operation states: which source file, which destination path, how big.
+pub trait PlannedFile {
+    fn source_rel(&self) -> &str;
+    fn destination_rel(&self) -> &str;
+    fn size(&self) -> u64;
+    fn source_mtime_ns(&self) -> i64;
+}
+
+impl PlannedFile for PlannedDeletion {
+    fn source_rel(&self) -> &str {
+        &self.source_rel
+    }
+    fn destination_rel(&self) -> &str {
+        &self.destination_rel
+    }
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn source_mtime_ns(&self) -> i64 {
+        self.source_mtime_ns
+    }
+}
+
+impl PlannedFile for PlannedMove {
+    fn source_rel(&self) -> &str {
+        &self.source_rel
+    }
+    fn destination_rel(&self) -> &str {
+        &self.destination_rel
+    }
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn source_mtime_ns(&self) -> i64 {
+        self.source_mtime_ns
+    }
+}
+
+/// A Subversion metadata folder to remove once every file of its working copy has been deleted
+/// (only when the scan was asked to; checked again on disk at apply time).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedMetadataRemoval {
+    pub metadata_rel: String,
+    pub files: u64,
+    pub bytes: u64,
 }
 
 /// Everything the identifier covers.
@@ -47,7 +106,13 @@ pub struct PlanBody {
     /// plans written before this field existed keep their identifier.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignored_stream_names: Vec<String>,
+    /// Omitted when empty, for the same reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_removals: Vec<PlannedMetadataRemoval>,
     pub actions: Vec<PlannedDeletion>,
+    /// Merge mode only; omitted when empty, for the same reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub moves: Vec<PlannedMove>,
 }
 
 /// A plan file.
@@ -72,6 +137,11 @@ impl Plan {
     /// Returns the total bytes the plan would free.
     pub fn total_bytes(&self) -> u64 {
         self.body.actions.iter().map(|action| action.size).sum()
+    }
+
+    /// Returns the total bytes the plan would move into the destination.
+    pub fn moved_bytes(&self) -> u64 {
+        self.body.moves.iter().map(|planned| planned.size).sum()
     }
 }
 
@@ -153,6 +223,8 @@ mod tests {
             delete_read_only: false,
             remove_emptied_dirs: true,
             ignored_stream_names: Vec::new(),
+            metadata_removals: Vec::new(),
+            moves: Vec::new(),
             actions: vec![PlannedDeletion {
                 source_rel: "a/b.txt".to_string(),
                 destination_rel: "x/b.txt".to_string(),
@@ -209,6 +281,8 @@ mod tests {
         let plan = sample_plan();
         let text = serde_json::to_string(&plan).unwrap();
         assert!(!text.contains("ignored_stream_names"), "empty list is not written");
+        assert!(!text.contains("metadata_removals"), "empty list is not written");
+        assert!(!text.contains("\"moves\""), "empty list is not written");
         let mut with_streams = plan.body.clone();
         with_streams.ignored_stream_names = vec!["com.dropbox.*".to_string()];
         assert_ne!(compute_plan_id(&with_streams).unwrap(), plan.plan_id);

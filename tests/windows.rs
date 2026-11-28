@@ -57,6 +57,7 @@ fn scan_roots(source: &Path, destination: &Path, work: &Path) -> anyhow::Result<
         mode: MatchMode::Content,
         config: test_config(),
         work_dir: work.to_path_buf(),
+        reports_dir: work.join("reports"),
     })
 }
 
@@ -395,4 +396,83 @@ fn junction_root_pointing_into_the_destination_is_refused() {
     assert!(run_command("cmd", &["/C", "mklink", "/J", &display_path(&junction), &display_path(&target)]));
     let other_work = sandbox.source.parent().unwrap().join("work2");
     assert!(scan_roots(&junction, &sandbox.destination, &other_work).is_err());
+}
+
+// ----------------------------------------------------------------------------------------------
+// Permissions, locked destinations and ambiguous paths
+// ----------------------------------------------------------------------------------------------
+
+/// Well-known SID of "Everyone", independent of the Windows display language.
+const EVERYONE_SID: &str = "*S-1-1-0";
+
+/// Denies deletion of a file to everyone (DELETE on the file, DELETE CHILD on its folder) until
+/// dropped, the way protected system files refuse it.
+struct DeleteDenied {
+    file: String,
+    folder: String,
+}
+
+impl DeleteDenied {
+    /// Adds the deny entries; None if icacls refuses.
+    fn new(file: &Path) -> Option<Self> {
+        let guard = Self { file: display_path(file), folder: display_path(file.parent().unwrap()) };
+        let is_set = run_command("icacls", &[&guard.file, "/deny", &format!("{EVERYONE_SID}:(DE)")])
+            && run_command("icacls", &[&guard.folder, "/deny", &format!("{EVERYONE_SID}:(DC)")]);
+        is_set.then_some(guard)
+    }
+}
+
+impl Drop for DeleteDenied {
+    fn drop(&mut self) {
+        for path in [&self.file, &self.folder] {
+            run_command("icacls", &[path, "/remove:d", EVERYONE_SID]);
+        }
+    }
+}
+
+#[test]
+fn files_the_user_may_not_delete_are_predicted_by_the_scan() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.write_source("protected/system.dll", b"protected content");
+    sandbox.write_destination("system.dll", b"protected content");
+    let Some(_denied) = DeleteDenied::new(&path) else {
+        eprintln!("skipped: icacls could not deny deletion");
+        return;
+    };
+    let scan = sandbox.scan(MatchMode::Content);
+    assert!(scan.plan.body.actions.is_empty());
+    let csv = fs::read_to_string(&scan.csv_path).unwrap();
+    assert!(csv.lines().any(|line| line.contains("system.dll") && line.contains("access-denied")), "{csv}");
+}
+
+#[test]
+fn files_the_user_may_no_longer_delete_are_skipped_not_failed() {
+    let (sandbox, scan) = scanned_duplicate();
+    let Some(denied) = DeleteDenied::new(&sandbox.source_path("dup.txt")) else {
+        eprintln!("skipped: icacls could not deny deletion");
+        return;
+    };
+    let output = sandbox.apply(&scan);
+    drop(denied);
+    assert_eq!(output.results[0].status, ActionStatus::AccessDenied, "{:?}", output.results[0]);
+    assert!(!output.has_failures(), "a refused permission is a safe skip, not a failure");
+    assert!(sandbox.source_path("dup.txt").exists());
+}
+
+#[test]
+fn destination_open_for_writing_keeps_the_source() {
+    let (sandbox, scan) = scanned_duplicate();
+    let writer = hold(&sandbox.destination_path("dup.txt"), true, SHARE_READ | SHARE_WRITE | SHARE_DELETE);
+    let output = sandbox.apply(&scan);
+    assert_eq!(output.results[0].status, ActionStatus::InUse, "{:?}", output.results[0]);
+    drop(writer);
+    assert!(sandbox.source_path("dup.txt").exists());
+}
+
+#[test]
+fn drive_relative_roots_are_refused() {
+    let sandbox = Sandbox::new();
+    let drive = display_path(&sandbox.source)[..2].to_string();
+    let error = scan_roots(Path::new(&drive), &sandbox.destination, &sandbox.work).unwrap_err();
+    assert!(format!("{error:#}").contains("Ambiguous path"), "{error:#}");
 }

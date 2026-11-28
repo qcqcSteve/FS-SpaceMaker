@@ -17,12 +17,13 @@ use walkdir::WalkDir;
 /// Worker threads used by tests (small, but more than one to exercise parallel code).
 const TEST_THREADS: usize = 2;
 
-/// A temporary source, destination and work folder.
+/// A temporary source, destination, work (index) and reports folder.
 pub struct Sandbox {
     _dir: TempDir,
     pub source: PathBuf,
     pub destination: PathBuf,
     pub work: PathBuf,
+    pub reports: PathBuf,
 }
 
 impl Sandbox {
@@ -34,6 +35,7 @@ impl Sandbox {
             source: base.join("source"),
             destination: base.join("destination"),
             work: base.join("work"),
+            reports: base.join("reports"),
             _dir: dir,
         };
         for path in [&sandbox.source, &sandbox.destination, &sandbox.work] {
@@ -77,6 +79,7 @@ impl Sandbox {
             mode,
             config,
             work_dir: self.work.clone(),
+            reports_dir: self.reports.clone(),
         };
         run_scan(&request).unwrap()
     }

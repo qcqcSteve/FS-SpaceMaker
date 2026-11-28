@@ -19,6 +19,7 @@ fn request(source: &Path, destination: &Path, work: &Path) -> ScanRequest {
         mode: MatchMode::Content,
         config: test_config(),
         work_dir: work.to_path_buf(),
+        reports_dir: work.join("reports"),
     }
 }
 
@@ -54,6 +55,15 @@ fn refuses_a_work_folder_inside_the_source() {
     let sandbox = Sandbox::new();
     let work = sandbox.source.join("work");
     assert!(run_scan(&request(&sandbox.source, &sandbox.destination, &work)).is_err());
+}
+
+#[test]
+fn refuses_a_reports_folder_inside_the_source() {
+    let sandbox = Sandbox::new();
+    let mut scan_request = request(&sandbox.source, &sandbox.destination, &sandbox.work);
+    scan_request.reports_dir = sandbox.source.join("reports");
+    let error = run_scan(&scan_request).unwrap_err();
+    assert!(format!("{error:#}").contains("overlaps the source"), "{error:#}");
 }
 
 #[test]

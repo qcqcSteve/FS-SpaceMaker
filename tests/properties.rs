@@ -102,7 +102,9 @@ fn check_pairing(mode: MatchMode, scan: &fs_spacemaker::scan::ScanOutput) {
             MatchMode::SamePath => {
                 assert_eq!(name_key(&action.source_rel), name_key(&action.destination_rel))
             }
-            MatchMode::Relocated => assert_eq!(name_key(source_name), name_key(destination_name)),
+            MatchMode::Relocated | MatchMode::Merge => {
+                assert_eq!(name_key(source_name), name_key(destination_name))
+            }
         }
     }
 }

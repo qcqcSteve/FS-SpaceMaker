@@ -213,17 +213,21 @@ fn each_scan_replaces_the_previous_outputs() {
     let first = sandbox.scan(MatchMode::Content);
     sandbox.dry_run(&first);
     sandbox.apply(&first);
-    fs::write(sandbox.work.join("my-notes.txt"), b"keep me").unwrap();
+    fs::write(sandbox.reports.join("my-notes.txt"), b"keep me").unwrap();
     sandbox.write_source("other.txt", b"other");
     let second = sandbox.scan(MatchMode::Content);
     assert_eq!(second.plan_path, first.plan_path, "one plan file, replaced");
     assert!(second.plan.body.actions.is_empty());
-    let mut names: Vec<String> = fs::read_dir(&sandbox.work)
+    let mut names: Vec<String> = fs::read_dir(&sandbox.reports)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, vec!["index.sqlite", "my-notes.txt", "plan.json", "report.csv", "report.html"]);
+    let expected = ["apply-journal.csv", "my-notes.txt", "plan.json", "report.csv", "report.html"];
+    assert_eq!(names, expected);
+    assert!(sandbox.work.join("index.sqlite").is_file(), "the index stays in the work folder");
+    let journal = fs::read_to_string(sandbox.reports.join("apply-journal.csv")).unwrap();
+    assert!(journal.contains(",deleted,"), "the trace of real deletions survives later scans");
 }
 
 #[test]
@@ -239,6 +243,9 @@ fn real_apply_appends_to_its_journal() {
     assert_eq!(journal.lines().filter(|line| line.starts_with("timestamp,")).count(), 1, "one header");
     assert!(journal.contains(",deleted,"), "the deletion of the first run is kept");
     assert!(journal.contains(",skipped-source-missing,"));
+    let run_lines: Vec<&str> = journal.lines().filter(|line| line.contains(",run-started,")).collect();
+    assert_eq!(run_lines.len(), 2, "each run opens with its own line");
+    assert!(run_lines.iter().all(|line| line.contains(&scan.plan.plan_id)), "the plan is identified");
 }
 
 #[test]

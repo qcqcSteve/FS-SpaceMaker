@@ -1,3 +1,10 @@
 /target
 fs-spacemaker-work/
 fs-spacemaker.config.json
+/reports/
+run-spacemaker.last.json
+# Local Claude Code settings and graphify working files (the shared graph and report stay tracked)
+/.claude/
+/graphify-out/*
+!/graphify-out/graph.json
+!/graphify-out/GRAPH_REPORT.md

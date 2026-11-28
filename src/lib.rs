@@ -19,4 +19,6 @@ pub mod progress;
 pub mod report;
 pub mod scan;
 pub mod space;
+pub mod targets;
 pub mod tree_match;
+pub mod vcs;

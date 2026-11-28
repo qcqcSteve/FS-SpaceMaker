@@ -2,7 +2,7 @@
 //! Relative paths are stored with '/' separators so plans are portable and easy to validate.
 //! Canonical roots keep the Windows verbatim prefix (\\?\) so paths longer than 260 characters work.
 
-use std::path::{Component, MAIN_SEPARATOR, MAIN_SEPARATOR_STR, Path, PathBuf};
+use std::path::{Component, MAIN_SEPARATOR, MAIN_SEPARATOR_STR, Path, PathBuf, Prefix};
 
 use anyhow::{Context, Result, bail};
 
@@ -18,6 +18,10 @@ pub const IS_CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
 const VERBATIM_UNC_PREFIX: &str = r"\\?\UNC\";
 const VERBATIM_PREFIX: &str = r"\\?\";
 const UNC_PREFIX: &str = r"\\";
+/// Wildcard allowed at the end of a name pattern: "com.dropbox.*" matches every name with that prefix.
+pub const NAME_PATTERN_WILDCARD: char = '*';
+/// Characters never allowed in a name pattern (the wildcard only as the last character).
+const FORBIDDEN_NAME_PATTERN_CHARS: [char; 4] = [NAME_PATTERN_WILDCARD, ':', '\\', '/'];
 
 // ----------------------------------------------------------------------------------------------
 // Roots
@@ -25,6 +29,7 @@ const UNC_PREFIX: &str = r"\\";
 
 /// Resolves a user-supplied folder to its canonical form; fails if it is missing or not a folder.
 pub fn canonical_root(path: &Path) -> Result<PathBuf> {
+    ensure_not_drive_relative(path)?;
     let canonical = path.canonicalize().with_context(|| {
         format!(
             "Folder not found or not accessible: {}. Check the path and your permissions.",
@@ -38,6 +43,27 @@ pub fn canonical_root(path: &Path) -> Result<PathBuf> {
         bail!("Folder path is not valid Unicode: {}. Rename it or choose a parent folder.", path.display());
     }
     Ok(canonical)
+}
+
+/// Fails for a Windows drive-relative path such as "S:" or "S:data": it designates the current
+/// folder of that drive (often not its root), a classic cause of scanning the wrong folder.
+fn ensure_not_drive_relative(path: &Path) -> Result<()> {
+    let mut components = path.components();
+    let drive = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => Some(char::from(letter)),
+            _ => None,
+        },
+        _ => None,
+    };
+    match drive {
+        Some(letter) if components.next() != Some(Component::RootDir) => bail!(
+            "Ambiguous path {}: without a backslash after the drive letter it means the current folder \
+             of drive {letter}:, not its root. Write {letter}:\\ for the drive root, or a full path.",
+            path.display()
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// Fails unless the two roots are distinct and neither one contains the other.
@@ -202,6 +228,22 @@ pub fn name_key(name: &str) -> String {
     if IS_CASE_INSENSITIVE { name.to_lowercase() } else { name.to_string() }
 }
 
+/// Returns true if a name matches a pattern (case-insensitive; a trailing '*' matches a prefix).
+pub fn matches_name_pattern(name: &str, pattern: &str) -> bool {
+    let name = name.to_lowercase();
+    let pattern = pattern.to_lowercase();
+    match pattern.strip_suffix(NAME_PATTERN_WILDCARD) {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == pattern,
+    }
+}
+
+/// Returns true if a pattern is a non-empty name, with the wildcard allowed only at its end.
+pub fn is_valid_name_pattern(pattern: &str) -> bool {
+    let name = pattern.strip_suffix(NAME_PATTERN_WILDCARD).unwrap_or(pattern);
+    !name.is_empty() && !name.contains(FORBIDDEN_NAME_PATTERN_CHARS)
+}
+
 // ----------------------------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------------------------
@@ -265,6 +307,31 @@ mod tests {
     fn overlap_guard_ignores_case_where_platform_does() {
         let result = ensure_disjoint_roots(Path::new("Base"), Path::new("base").join("x").as_path());
         assert_eq!(result.is_err(), IS_CASE_INSENSITIVE);
+    }
+
+    #[test]
+    fn name_patterns_match_exact_names_or_prefixes() {
+        assert!(matches_name_pattern(".Trash-1000", ".trash-*"));
+        assert!(matches_name_pattern("$Recycle.Bin", "$RECYCLE.BIN"));
+        assert!(!matches_name_pattern("$Recycle.Bin.old", "$RECYCLE.BIN"));
+        assert!(!matches_name_pattern("Trash", ".Trash-*"));
+        for valid in [".Trash-*", "Exact", "com.dropbox.*"] {
+            assert!(is_valid_name_pattern(valid), "{valid:?} should be accepted");
+        }
+        for invalid in ["", "*", "a*b", "a:b", "*.txt", "a/b", r"a\b"] {
+            assert!(!is_valid_name_pattern(invalid), "{invalid:?} should be rejected");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_paths_are_refused() {
+        for ambiguous in ["S:", "S:data", r"\\?\S:"] {
+            assert!(ensure_not_drive_relative(Path::new(ambiguous)).is_err(), "{ambiguous:?}");
+        }
+        for clear in [r"S:\", r"S:\data", r"\\?\S:\data", "relative", r"\\server\share\x"] {
+            assert!(ensure_not_drive_relative(Path::new(clear)).is_ok(), "{clear:?}");
+        }
     }
 
     #[test]

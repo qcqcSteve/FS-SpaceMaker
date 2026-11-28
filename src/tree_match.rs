@@ -251,7 +251,14 @@ mod tests {
             .iter()
             .map(|rel| FileRecord { rel: rel.to_string(), size: 1, mtime_ns: 0, is_read_only: false })
             .collect();
-        Inventory { root: PathBuf::new(), files: records, dirs, skipped: Vec::new(), errors: Vec::new() }
+        Inventory {
+            root: PathBuf::new(),
+            files: records,
+            dirs,
+            metadata_dirs: Vec::new(),
+            skipped: Vec::new(),
+            errors: Vec::new(),
+        }
     }
 
     /// Declares identical pairs by relative path.

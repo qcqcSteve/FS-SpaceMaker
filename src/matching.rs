@@ -1,6 +1,7 @@
 //! Decides, for each source file, whether an identical destination file exists in the chosen mode.
 //! Identity is proven in three narrowing stages: bucket (size + mode label), prefix digest, full
-//! digest. Only files sharing a bucket with the other side are ever read.
+//! digest. Only files sharing a bucket with the other side are ever read. Merge mode stops at the
+//! bucket (file name + size) and reads nothing.
 
 use std::collections::HashMap;
 
@@ -26,6 +27,9 @@ pub enum MatchMode {
     SamePath,
     /// Whole source folders found, identical, elsewhere in the destination.
     Relocated,
+    /// Same file name and size anywhere in the destination: deleted; every other source file is
+    /// moved into the destination, so the source ends empty.
+    Merge,
 }
 
 impl MatchMode {
@@ -35,6 +39,7 @@ impl MatchMode {
             Self::Content => "content",
             Self::SamePath => "same-path",
             Self::Relocated => "relocated",
+            Self::Merge => "merge",
         }
     }
 }
@@ -50,6 +55,7 @@ pub enum ResidualReason {
     ReadOnly,
     SameFile,
     AlternateStreams,
+    AccessDenied,
 }
 
 impl ResidualReason {
@@ -64,6 +70,7 @@ impl ResidualReason {
             Self::ReadOnly => "read-only",
             Self::SameFile => "same-physical-file",
             Self::AlternateStreams => "alternate-streams",
+            Self::AccessDenied => "access-denied",
         }
     }
 
@@ -73,6 +80,7 @@ impl ResidualReason {
             (Self::NoCandidate, MatchMode::Content) => "no destination file has this size",
             (Self::NoCandidate, MatchMode::SamePath) => "no destination file of this size at the same path",
             (Self::NoCandidate, MatchMode::Relocated) => "no destination file with this name and size",
+            (Self::NoCandidate, MatchMode::Merge) => "no destination file with this name and size: moved",
             (Self::ContentDiffers, _) => "destination candidates have different content",
             (Self::EmptyFileExcluded, _) => "empty file: frees nothing (see include_empty_files)",
             (Self::Unreadable, _) => "file could not be read",
@@ -82,6 +90,7 @@ impl ResidualReason {
             (Self::AlternateStreams, _) => {
                 "hidden NTFS stream missing or different on the destination copy: protected"
             }
+            (Self::AccessDenied, _) => "no permission to delete (protected system file or other owner)",
         }
     }
 }
@@ -108,6 +117,8 @@ pub struct MatchOutcome {
     pub matches: Vec<FileMatch>,
     pub residual: Vec<(usize, ResidualReason)>,
     pub trees: Vec<RelocatedTree>,
+    /// Merge mode: source files to move into the destination (filled by the scan).
+    pub moves: Vec<usize>,
 }
 
 /// Everything matching needs.
@@ -136,6 +147,9 @@ struct IdenticalFiles {
 pub fn match_files(context: &mut MatchContext) -> MatchOutcome {
     let source = context.source.inventory();
     let destination = context.destination.inventory();
+    if context.mode == MatchMode::Merge {
+        return match_by_name_and_size(source, destination);
+    }
     let (eligible, mut residual) = select_eligible(source, context.mode, context.include_empty_files);
     let found = find_identical(context, &eligible);
     residual.extend(found.reasons);
@@ -150,7 +164,7 @@ pub fn match_files(context: &mut MatchContext) -> MatchOutcome {
                 .filter(|index| !matched.contains(index))
                 .map(|&index| (index, ResidualReason::NotInMatchedTree)),
         );
-        MatchOutcome { matches: tree_outcome.matches, residual, trees: tree_outcome.trees }
+        MatchOutcome { matches: tree_outcome.matches, residual, trees: tree_outcome.trees, moves: Vec::new() }
     } else {
         let matches = found
             .identical
@@ -160,7 +174,7 @@ pub fn match_files(context: &mut MatchContext) -> MatchOutcome {
                 destination: choose_destination(source, destination, index, candidates),
             })
             .collect();
-        MatchOutcome { matches, residual, trees: Vec::new() }
+        MatchOutcome { matches, residual, ..MatchOutcome::default() }
     };
     outcome.matches.sort_by_key(|file_match| file_match.source);
     outcome.residual.sort_by_key(|&(index, _)| index);
@@ -185,9 +199,29 @@ fn bucket_key(record: &FileRecord, mode: MatchMode) -> BucketKey {
     let label = match mode {
         MatchMode::Content => String::new(),
         MatchMode::SamePath => name_key(&record.rel),
-        MatchMode::Relocated => name_key(file_name_of(&record.rel)),
+        MatchMode::Relocated | MatchMode::Merge => name_key(file_name_of(&record.rel)),
     };
     (record.size, label)
+}
+
+/// Merge mode: pairs each source file with a destination file of the same name and size, reading
+/// nothing (no fingerprint). Unpaired files go to the residual, from which the scan plans moves.
+fn match_by_name_and_size(source: &Inventory, destination: &Inventory) -> MatchOutcome {
+    let mut buckets: HashMap<BucketKey, Vec<usize>> = HashMap::new();
+    for (index, file) in destination.files.iter().enumerate() {
+        buckets.entry(bucket_key(file, MatchMode::Merge)).or_default().push(index);
+    }
+    let mut outcome = MatchOutcome::default();
+    for (index, file) in source.files.iter().enumerate() {
+        match buckets.get(&bucket_key(file, MatchMode::Merge)) {
+            Some(candidates) => outcome.matches.push(FileMatch {
+                source: index,
+                destination: choose_destination(source, destination, index, candidates),
+            }),
+            None => outcome.residual.push((index, ResidualReason::NoCandidate)),
+        }
+    }
+    outcome
 }
 
 /// Finds, for each eligible source file, every destination file with identical content.

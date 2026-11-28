@@ -24,6 +24,8 @@ fn scan_through_cli(sandbox: &Sandbox) -> (PathBuf, String) {
         .arg(&sandbox.destination)
         .arg("--work-dir")
         .arg(&sandbox.work)
+        .arg("--reports-dir")
+        .arg(&sandbox.reports)
         .assert()
         .success()
         .stdout(predicate::str::contains("Result (nothing deleted)"))
@@ -34,6 +36,14 @@ fn scan_through_cli(sandbox: &Sandbox) -> (PathBuf, String) {
     let plan_line = text.lines().find(|line| line.trim_start().starts_with("plan:")).unwrap();
     let plan = PathBuf::from(plan_line.trim_start().trim_start_matches("plan:").trim());
     let command_line = text.lines().rev().find(|line| line.contains("--confirm")).unwrap();
+    if cfg!(windows) {
+        assert!(
+            command_line.trim_start().starts_with("& \""),
+            "ready to paste in PowerShell: {command_line}"
+        );
+        let dry_run_line = text.lines().find(|line| line.contains("--dry-run")).unwrap();
+        assert!(dry_run_line.trim_start().starts_with("& \""), "{dry_run_line}");
+    }
     let code = command_line.rsplit(' ').next().unwrap().to_string();
     (plan, code)
 }
@@ -88,6 +98,8 @@ fn overlapping_roots_fail_with_a_clear_message() {
         .arg(&inner)
         .arg("--work-dir")
         .arg(&sandbox.work)
+        .arg("--reports-dir")
+        .arg(&sandbox.reports)
         .assert()
         .code(1)
         .stderr(predicate::str::contains("inside source"));

@@ -174,7 +174,8 @@
     const native = rel.split("/").join(separator);
     return root.endsWith(separator) ? root + native : root + separator + native;
   }
-  const OK_TAGS = new Set(["deleted", "would-delete", "removed-folder", "content", "same-path", "relocated"]);
+  const OK_TAGS = new Set(["deleted", "would-delete", "moved", "would-move", "move", "removed-folder", "content",
+    "same-path", "relocated", "merge"]);
   const FAIL_TAGS = new Set(["failed", "error"]);
   function tagClass(tag) {
     if (OK_TAGS.has(tag)) return "tag ok";
